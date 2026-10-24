@@ -53,6 +53,7 @@ class AppShell extends ConsumerStatefulWidget {
 
 class _AppShellState extends ConsumerState<AppShell> {
   int _index = 0;
+  final Set<int> _visited = {0};
 
   @override
   void initState() {
@@ -75,6 +76,24 @@ class _AppShellState extends ConsumerState<AppShell> {
       // Window decoration is cosmetic; never let it break startup.
       debugPrint('window init skipped: $error');
     }
+  }
+
+  void _select(int index) {
+    setState(() {
+      _index = index;
+      _visited.add(index); // 懒构建 + 保活：未访问过的页面不参与首帧
+    });
+  }
+
+  Widget _pageFor(int index) {
+    const pages = [
+      DashboardPage(),
+      CoursesPage(),
+      TasksPage(),
+      LogsPage(),
+      SettingsPage(),
+    ];
+    return KeyedSubtree(key: ValueKey('page-$index'), child: pages[index]);
   }
 
   @override
@@ -101,14 +120,6 @@ class _AppShellState extends ConsumerState<AppShell> {
       }
     });
 
-    final pages = const [
-      DashboardPage(),
-      CoursesPage(),
-      TasksPage(),
-      LogsPage(),
-      SettingsPage(),
-    ];
-
     return Scaffold(
       appBar: AppBar(
         title: Text(_destinations[_index].label),
@@ -121,7 +132,7 @@ class _AppShellState extends ConsumerState<AppShell> {
         children: [
           NavigationRail(
             selectedIndex: _index,
-            onDestinationSelected: (value) => setState(() => _index = value),
+            onDestinationSelected: _select,
             labelType: NavigationRailLabelType.all,
             leading: Padding(
               padding: const EdgeInsets.symmetric(vertical: 12),
@@ -152,10 +163,50 @@ class _AppShellState extends ConsumerState<AppShell> {
           Expanded(
             child: connection == ConnState.error
                 ? _ErrorPane(onRetry: () => ref.read(connectionProvider.notifier).retry())
-                : IndexedStack(index: _index, children: pages),
+                : Stack(
+                    children: [
+                      for (var i = 0; i < _destinations.length; i++)
+                        if (_visited.contains(i))
+                          Offstage(
+                            offstage: i != _index,
+                            child: TickerMode(
+                              enabled: i == _index,
+                              child: i == _index
+                                  ? _PageFadeIn(
+                                      key: ValueKey('fade-$_index'),
+                                      child: _pageFor(i),
+                                    )
+                                  : _pageFor(i),
+                            ),
+                          ),
+                    ],
+                  ),
           ),
         ],
       ),
+    );
+  }
+}
+
+class _PageFadeIn extends StatelessWidget {
+  const _PageFadeIn({super.key, required this.child});
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return TweenAnimationBuilder<double>(
+      tween: Tween(begin: 0, end: 1),
+      duration: const Duration(milliseconds: 180),
+      curve: Curves.easeOutCubic,
+      builder: (context, value, child) => Opacity(
+        opacity: value.clamp(0.0, 1.0),
+        child: FractionalTranslation(
+          translation: Offset(0, 0.015 * (1 - value)),
+          child: child,
+        ),
+      ),
+      child: child,
     );
   }
 }

@@ -1,8 +1,10 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../core/models.dart';
 import '../state.dart';
+import '../widgets/skeleton.dart';
 
 class CoursesPage extends ConsumerWidget {
   const CoursesPage({super.key});
@@ -10,10 +12,9 @@ class CoursesPage extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final coursesAsync = ref.watch(coursesProvider);
-    final selected = ref.watch(selectedCoursesProvider);
 
     return coursesAsync.when(
-      loading: () => const Center(child: CircularProgressIndicator()),
+      loading: () => const SkeletonList(itemCount: 7),
       error: (error, stack) => _ErrorView(
         message: '$error',
         onRetry: () => ref.read(coursesProvider.notifier).refresh(),
@@ -26,11 +27,21 @@ class CoursesPage extends ConsumerWidget {
               children: [
                 Text('${courses.length} 门课程', style: Theme.of(context).textTheme.titleMedium),
                 const Spacer(),
-                TextButton.icon(
-                  onPressed: () => ref.read(selectedCoursesProvider.notifier).selectAll(courses),
-                  icon: const Icon(Icons.select_all),
-                  label: Text(selected.length == courses.length && courses.isNotEmpty ? '取消全选' : '全选'),
-                ),
+                // 只重建这一小块计数，不拖动整张列表。
+                Consumer(builder: (context, ref, _) {
+                  final selectedCount = ref.watch(
+                    selectedCoursesProvider.select((set) => set.length),
+                  );
+                  return TextButton.icon(
+                    onPressed: courses.isEmpty
+                        ? null
+                        : () => ref.read(selectedCoursesProvider.notifier).selectAll(courses),
+                    icon: const Icon(Icons.select_all),
+                    label: Text(
+                      selectedCount == courses.length && courses.isNotEmpty ? '取消全选' : '全选',
+                    ),
+                  );
+                }),
                 const SizedBox(width: 8),
                 FilledButton.tonalIcon(
                   onPressed: () => ref.read(coursesProvider.notifier).refresh(),
@@ -43,16 +54,15 @@ class CoursesPage extends ConsumerWidget {
           Expanded(
             child: courses.isEmpty
                 ? _EmptyView(onRefresh: () => ref.read(coursesProvider.notifier).refresh())
-                : ListView.separated(
+                : ListView.builder(
                     padding: const EdgeInsets.all(24),
                     itemCount: courses.length,
-                    separatorBuilder: (_, _) => const SizedBox(height: 8),
-                    itemBuilder: (context, index) => _CourseCard(
-                      course: courses[index],
-                      selected: selected.contains(courses[index].courseId),
-                      onToggle: () => ref
-                          .read(selectedCoursesProvider.notifier)
-                          .toggle(courses[index].courseId),
+                    itemExtent: 88,
+                    scrollCacheExtent: ScrollCacheExtent.pixels(600),
+                    addAutomaticKeepAlives: false,
+                    itemBuilder: (context, index) => Padding(
+                      padding: const EdgeInsets.only(bottom: 8),
+                      child: _CourseCard(course: courses[index]),
                     ),
                   ),
           ),
@@ -62,28 +72,38 @@ class CoursesPage extends ConsumerWidget {
   }
 }
 
-class _CourseCard extends StatelessWidget {
-  const _CourseCard({
-    required this.course,
-    required this.selected,
-    required this.onToggle,
-  });
+class _CourseCard extends ConsumerWidget {
+  const _CourseCard({required this.course});
 
   final Course course;
-  final bool selected;
-  final VoidCallback onToggle;
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
+    // 仅当本行的选中状态变化时才重建本行。
+    final selected = ref.watch(
+      selectedCoursesProvider.select((set) => set.contains(course.courseId)),
+    );
     final scheme = Theme.of(context).colorScheme;
+    void toggle() => ref.read(selectedCoursesProvider.notifier).toggle(course.courseId);
+
     return Card(
       color: selected ? scheme.secondaryContainer : null,
+      margin: EdgeInsets.zero,
       child: ListTile(
-        onTap: onToggle,
-        contentPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
-        leading: Checkbox(value: selected, onChanged: (_) => onToggle()),
-        title: Text(course.title, style: const TextStyle(fontWeight: FontWeight.w600)),
-        subtitle: Text('课程ID ${course.courseId} · 班级 ${course.clazzId} · ${course.teacher}'),
+        onTap: toggle,
+        contentPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 6),
+        leading: Checkbox(value: selected, onChanged: (_) => toggle()),
+        title: Text(
+          course.title,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(fontWeight: FontWeight.w600),
+        ),
+        subtitle: Text(
+          '课程ID ${course.courseId} · 班级 ${course.clazzId} · ${course.teacher}',
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+        ),
         trailing: selected
             ? Icon(Icons.check_circle, color: scheme.primary)
             : Icon(Icons.radio_button_unchecked, color: scheme.outline),
@@ -128,6 +148,8 @@ class _ErrorView extends StatelessWidget {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
+            Icon(Icons.error_outline, size: 40, color: Theme.of(context).colorScheme.error),
+            const SizedBox(height: 12),
             Text('读取课程失败', style: Theme.of(context).textTheme.titleMedium),
             const SizedBox(height: 8),
             Text(message, textAlign: TextAlign.center, style: Theme.of(context).textTheme.bodySmall),

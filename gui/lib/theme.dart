@@ -17,6 +17,8 @@ ThemeData buildFxxxxcTheme(Brightness brightness, Color seed) {
     useMaterial3: true,
     colorScheme: scheme,
     scaffoldBackgroundColor: scheme.surface,
+    fontFamily: 'AlibabaHealthCN',
+    fontFamilyFallback: const ['Microsoft YaHei UI', 'Microsoft YaHei', 'Segoe UI', 'sans-serif'],
   );
 
   return base.copyWith(

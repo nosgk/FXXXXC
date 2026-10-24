@@ -5,23 +5,34 @@ import '../core/engine_client.dart';
 import '../state.dart';
 import '../theme.dart';
 
-class DashboardPage extends ConsumerWidget {
+class DashboardPage extends ConsumerStatefulWidget {
   const DashboardPage({super.key});
 
-  Future<void> _control(
-    WidgetRef ref,
-    BuildContext context,
-    String method,
-  ) async {
+  @override
+  ConsumerState<DashboardPage> createState() => _DashboardPageState();
+}
+
+class _DashboardPageState extends ConsumerState<DashboardPage> {
+  final Set<String> _pending = {};
+
+  bool get _busy => _pending.isNotEmpty;
+
+  Future<void> _control(String method) async {
+    if (_pending.contains(method)) return; // 防抖
+    setState(() => _pending.add(method));
     try {
       await ref.read(engineClientProvider).rpc(method);
     } on EngineException catch (error) {
-      if (!context.mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(error.message)));
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(error.message)));
+      }
+    } finally {
+      if (mounted) setState(() => _pending.remove(method));
     }
   }
 
-  Future<void> _start(BuildContext context, WidgetRef ref) async {
+  Future<void> _start() async {
+    if (_pending.contains('study.start')) return;
     final selected = ref.read(selectedCoursesProvider);
     if (selected.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -29,18 +40,22 @@ class DashboardPage extends ConsumerWidget {
       );
       return;
     }
+    setState(() => _pending.add('study.start'));
     try {
       await ref.read(engineClientProvider).rpc('study.start', {
         'course_ids': selected.toList(),
       });
     } on EngineException catch (error) {
-      if (!context.mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(error.message)));
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(error.message)));
+      }
+    } finally {
+      if (mounted) setState(() => _pending.remove('study.start'));
     }
   }
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  Widget build(BuildContext context) {
     final status = ref.watch(statusProvider);
     final selected = ref.watch(selectedCoursesProvider);
     final running = status.state == 'running' || status.state == 'loading' || status.state == 'paused';
@@ -71,26 +86,29 @@ class DashboardPage extends ConsumerWidget {
                     const Spacer(),
                     if (!running)
                       FilledButton.icon(
-                        onPressed: () => _start(context, ref),
-                        icon: const Icon(Icons.play_arrow),
+                        onPressed: _busy ? null : _start,
+                        icon: _pending.contains('study.start')
+                            ? const SizedBox(width: 16, height: 16,
+                                child: CircularProgressIndicator(strokeWidth: 2))
+                            : const Icon(Icons.play_arrow),
                         label: Text(selected.isEmpty ? '开始学习' : '开始学习 (${selected.length})'),
                       )
                     else ...[
                       if (status.state == 'paused')
                         FilledButton.icon(
-                          onPressed: () => _control(ref, context, 'study.resume'),
+                          onPressed: _busy ? null : () => _control('study.resume'),
                           icon: const Icon(Icons.play_arrow),
                           label: const Text('继续'),
                         )
                       else
                         OutlinedButton.icon(
-                          onPressed: () => _control(ref, context, 'study.pause'),
+                          onPressed: _busy ? null : () => _control('study.pause'),
                           icon: const Icon(Icons.pause),
                           label: const Text('暂停'),
                         ),
                       const SizedBox(width: 8),
                       FilledButton.tonalIcon(
-                        onPressed: () => _control(ref, context, 'study.stop'),
+                        onPressed: _busy ? null : () => _control('study.stop'),
                         icon: const Icon(Icons.stop),
                         label: const Text('停止'),
                       ),
@@ -122,22 +140,31 @@ class DashboardPage extends ConsumerWidget {
           ),
         ),
         const SizedBox(height: 16),
-        Row(
-          children: [
+        // 响应式网格：窄窗口 2 列，宽窗口最多 4 列，避免溢出。
+        LayoutBuilder(builder: (context, constraints) {
+          const gap = 12.0;
+          final columns = (constraints.maxWidth / 220).floor().clamp(2, 4);
+          final cardWidth = (constraints.maxWidth - gap * (columns - 1)) / columns;
+          final cards = [
             _StatCard(label: '课程', value: '${status.courses}', icon: Icons.school_outlined),
-            const SizedBox(width: 12),
             _StatCard(label: '章节', value: '${status.total}', icon: Icons.menu_book_outlined),
-            const SizedBox(width: 12),
             _StatCard(label: '已完成', value: '${status.done}', icon: Icons.task_alt_outlined),
-            const SizedBox(width: 12),
             _StatCard(
               label: '失败',
               value: '${status.failed}',
               icon: Icons.error_outline,
               tone: status.failed > 0 ? kErrorColor : null,
             ),
-          ],
-        ),
+          ];
+          return Wrap(
+            spacing: gap,
+            runSpacing: gap,
+            children: [
+              for (final card in cards)
+                SizedBox(width: cardWidth, height: 84, child: card),
+            ],
+          );
+        }),
         const SizedBox(height: 16),
         Card(
           child: Padding(
@@ -193,23 +220,24 @@ class _StatCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    return Expanded(
-      child: Card(
-        child: Padding(
-          padding: const EdgeInsets.all(16),
-          child: Row(
-            children: [
-              Icon(icon, color: tone ?? scheme.primary),
-              const SizedBox(width: 12),
-              Column(
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Row(
+          children: [
+            Icon(icon, color: tone ?? scheme.primary),
+            const SizedBox(width: 12),
+            Flexible(
+              child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
                 children: [
                   Text(value, style: Theme.of(context).textTheme.titleLarge),
                   Text(label, style: Theme.of(context).textTheme.bodySmall),
                 ],
               ),
-            ],
-          ),
+            ),
+          ],
         ),
       ),
     );

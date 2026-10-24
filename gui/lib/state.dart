@@ -2,17 +2,22 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'core/engine_client.dart';
 import 'core/models.dart';
 
 final engineClientProvider = Provider<EngineClient>((ref) => EngineClient());
 
+const _selectedCoursesKey = 'selected_courses';
+
 enum ConnState { connecting, ready, error }
 
 class ConnectionNotifier extends Notifier<ConnState> {
   StreamSubscription? _sub;
   Timer? _poll;
+  Timer? _logFlush;
+  final List<LogEntry> _logBuffer = [];
   bool _starting = false;
 
   @override
@@ -20,6 +25,7 @@ class ConnectionNotifier extends Notifier<ConnState> {
     ref.onDispose(() {
       _sub?.cancel();
       _poll?.cancel();
+      _logFlush?.cancel();
     });
     // Startup is triggered from AppShell's post-frame callback so the first
     // frame paints immediately; never block it on process/native work.
@@ -31,6 +37,7 @@ class ConnectionNotifier extends Notifier<ConnState> {
     _starting = true;
     try {
       await start();
+      unawaited(ref.read(selectedCoursesProvider.notifier).restore());
     } finally {
       _starting = false;
     }
@@ -60,7 +67,16 @@ class ConnectionNotifier extends Notifier<ConnState> {
     final data = (event['data'] as Map?)?.cast<String, dynamic>() ?? const {};
     switch (type) {
       case 'log':
-        ref.read(logsProvider.notifier).add(LogEntry.fromJson(data));
+        // Batch log floods: one list rebuild per 150ms instead of per line.
+        _logBuffer.add(LogEntry.fromJson(data));
+        _logFlush ??= Timer(const Duration(milliseconds: 150), () {
+          final batch = List<LogEntry>.of(_logBuffer);
+          _logBuffer.clear();
+          _logFlush = null;
+          if (batch.isNotEmpty) {
+            ref.read(logsProvider.notifier).addAll(batch);
+          }
+        });
         break;
       case 'state.changed':
         ref.read(statusProvider.notifier).patchState(
@@ -120,13 +136,18 @@ final connectionProvider =
     NotifierProvider<ConnectionNotifier, ConnState>(ConnectionNotifier.new);
 
 class LogsNotifier extends Notifier<List<LogEntry>> {
+  static const _maxLines = 800;
+
   @override
   List<LogEntry> build() => const [];
 
-  void add(LogEntry entry) {
-    final next = [...state, entry];
-    if (next.length > 1000) {
-      next.removeRange(0, next.length - 1000);
+  void add(LogEntry entry) => addAll([entry]);
+
+  void addAll(List<LogEntry> entries) {
+    if (entries.isEmpty) return;
+    final next = [...state, ...entries];
+    if (next.length > _maxLines) {
+      next.removeRange(0, next.length - _maxLines);
     }
     state = next;
   }
@@ -216,13 +237,21 @@ class CoursesNotifier extends AsyncNotifier<List<Course>> {
   }
 
   Future<void> refresh() async {
+    if (state.isLoading) return; // 防抖：进行中的刷新直接忽略
     state = const AsyncLoading<List<Course>>();
     state = await AsyncValue.guard(() async {
       final result = await ref.read(engineClientProvider).rpc('courses.list', {'refresh': true});
       final items = (result is Map ? result['courses'] as List? : null) ?? const [];
-      return items
+      final courses = items
           .map((item) => Course.fromJson((item as Map).cast<String, dynamic>()))
           .toList();
+      // 状态同步：课程列表变化后修剪已失效的选课 ID。
+      if (courses.isNotEmpty) {
+        ref
+            .read(selectedCoursesProvider.notifier)
+            .retainAll(courses.map((course) => course.courseId).toSet());
+      }
+      return courses;
     });
   }
 }
@@ -234,18 +263,51 @@ class SelectedCoursesNotifier extends Notifier<Set<String>> {
   @override
   Set<String> build() => {};
 
+  /// Restore persisted selection (GUI ↔ 引擎状态双向同步的本地半边)。
+  Future<void> restore() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final saved = prefs.getStringList(_selectedCoursesKey) ?? const [];
+      if (saved.isNotEmpty && state.isEmpty) {
+        state = saved.toSet();
+      }
+    } catch (_) {
+      // Persistence is best-effort; selection still works in-memory.
+    }
+  }
+
+  Future<void> _persist() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setStringList(_selectedCoursesKey, state.toList());
+    } catch (_) {}
+  }
+
   void toggle(String courseId) {
     final next = {...state};
     if (!next.remove(courseId)) next.add(courseId);
     state = next;
+    unawaited(_persist());
   }
 
   void selectAll(List<Course> courses) {
     final all = courses.map((course) => course.courseId).toSet();
     state = state.length == all.length ? <String>{} : all;
+    unawaited(_persist());
   }
 
-  void clear() => state = {};
+  void clear() {
+    state = {};
+    unawaited(_persist());
+  }
+
+  void retainAll(Set<String> ids) {
+    final next = state.intersection(ids);
+    if (next.length != state.length) {
+      state = next;
+      unawaited(_persist());
+    }
+  }
 }
 
 final selectedCoursesProvider =
