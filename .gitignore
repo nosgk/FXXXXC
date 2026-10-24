@@ -148,6 +148,8 @@ gui/build/
 gui/.dart_tool/
 gui/windows/flutter/ephemeral/
 gui/*.iml
+# the generic `lib/` rule above would ignore Flutter sources
+!gui/lib/
 
 # Custom files
 .cookies.txt
