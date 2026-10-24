@@ -140,6 +140,15 @@ uv.lock
 # poetry
 poetry.lock
 
+# Internal development docs (local only; never commit)
+docs/
+
+# Flutter / Dart build artifacts
+gui/build/
+gui/.dart_tool/
+gui/windows/flutter/ephemeral/
+gui/*.iml
+
 # Custom files
 .cookies.txt
 cookies.txt

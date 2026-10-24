@@ -1,158 +1,129 @@
-# :computer: 超星学习通自动化完成任务点(命令行版)
+# :computer: FXXXXC —— 超星学习通自动化完成任务点（CLI + Windows 桌面端）
 
 <p align="center">
-    <a href="https://github.com/Samueli924/chaoxing" target="_blank" style="margin-right: 20px; font-style: normal; text-decoration: none;">
-        <img src="https://img.shields.io/github/stars/Samueli924/chaoxing" alt="Github Stars" />
+    <a href="https://github.com/nosgk/FXXXXC" target="_blank">
+        <img src="https://img.shields.io/github/stars/nosgk/FXXXXC" alt="Github Stars" />
     </a>
-    <a href="https://github.com/Samueli924/chaoxing" target="_blank" style="margin-right: 20px; font-style: normal; text-decoration: none;">
-        <img src="https://img.shields.io/github/forks/Samueli924/chaoxing" alt="Github Forks" />
+    <a href="https://github.com/nosgk/FXXXXC" target="_blank">
+        <img src="https://img.shields.io/github/languages/code-size/nosgk/FXXXXC" alt="Code size" />
     </a>
-    <a href="https://github.com/Samueli924/chaoxing" target="_blank" style="margin-right: 20px; font-style: normal; text-decoration: none;">
-        <img src="https://img.shields.io/github/languages/code-size/Samueli924/chaoxing" alt="Code-size" />
-    </a>
-    <a href="https://github.com/Samueli924/chaoxing" target="_blank" style="margin-right: 20px; font-style: normal; text-decoration: none;">
-        <img src="https://img.shields.io/github/v/release/Samueli924/chaoxing?display_name=tag&sort=semver" alt="version" />
-    </a>
+    <img src="https://img.shields.io/badge/python-3.13+-blue" alt="python" />
+    <img src="https://img.shields.io/badge/license-GPL--3.0-green" alt="license" />
 </p>
-:muscle: 本项目的最终目的是通过开源消灭所谓的付费刷课平台，希望有能力的朋友都可以为这个项目提交代码，支持本项目的良性发展
 
-:star: 觉得有帮助的朋友可以给个Star
+本项目的最终目的是通过开源消灭所谓的付费刷课平台。希望有能力的朋友提交代码，支持项目良性发展。
 
-## :point_up: 更新通知
-20241021更新通知： 感谢[sz134055](https://github.com/sz134055)提交代码[PR #360](https://github.com/Samueli924/chaoxing/pull/360)，**添加了对题库答题的支持**  
+> **FXXXXC** 在 Samueli924/chaoxing 的 CLI 能力之上做了工程化改造：
+> - 修复了会话、任务队列、题库缓存等一批影响稳定性的问题；
+> - 拆分核心模块为可测试的 `fxxxxc/` 包（旧的 `api/` 导入路径保持兼容）；
+> - 新增 **本地 Python 引擎 + Flutter/Material You Windows 桌面客户端**；
+> - 提供手动触发（不随推送自动构建）的 GitHub Actions 质量门禁与 Windows 便携包构建。
+
+## :warning: 免责声明
+
+- 本代码遵循 [GPL-3.0 License](./LICENSE)，允许**开源/免费使用和引用/修改/衍生代码的开源/免费使用**，不允许修改和衍生的代码作为闭源商业软件发布和销售，禁止使用本代码盈利。
+- 本代码仅用于**学习讨论**，禁止用于盈利；使用者的一切行为与作者无关。
 
 ## :books: 使用方法
 
-### 源码运行（Python 3.13+）
-
-1. clone 项目至本地
+### 1. 源码运行（Python 3.13+）
 
 ```bash
-git clone --depth=1 https://github.com/Samueli924/chaoxing 
-cd chaoxing
-```
-
-2. 安装依赖
-
-```bash
+git clone https://github.com/nosgk/FXXXXC
+cd FXXXXC
 pip install -r requirements.txt
 ```
-或使用 `pip install .`（通过 pyproject.toml 安装依赖）
 
-3. (可选直接运行)
-
-```bash
-python main.py
-```
-
-4. (可选配置文件运行)
-
-> 复制config_template.ini文件为config.ini文件，修改文件内的账号密码内容
+复制 `config_template.ini` 为 `config.ini` 并填写账号/题库，然后：
 
 ```bash
-python main.py -c config.ini
+python main.py                    # 读取当前目录 config.ini（无配置则交互输入）
+python main.py -c config.ini      # 指定配置文件
+python main.py -u 手机号 -p 密码 -l 课程ID1,课程ID2 -a retry
+python main.py --data-dir D:/fxxxxc-data -c D:/fxxxxc-data/config.ini
 ```
 
-5. (可选命令行运行)
+常用参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `-c/--config` | 配置文件路径 |
+| `--data-dir` | 数据目录（config.ini / cookies.txt / cache.json / 日志），默认当前目录 |
+| `-u/-p` | 手机号 / 密码 |
+| `-l/--list` | 课程 ID，逗号分隔 |
+| `-s/--speed` | 倍速（1.0-2.0） |
+| `-j/--jobs` | 并发章节数 |
+| `-a/--notopen-action` | retry / ask / continue |
+| `--retry-interval` | 重试间隔（秒） |
+| `-lc/--add-learning-count` | 完成后增加章节学习次数 |
+| `-tc/--target-count` | 学习次数目标 |
+| `-v/--verbose` | 调试日志 |
+
+退出码：`0` 成功；`1` 配置/登录错误；`2` 参数错误；`130` 用户中断。
+
+### 2. Windows 桌面客户端（Material You）
+
+从 Releases（或 Actions 手动构建产物）下载 `FXXXXC-windows-x64-*.zip`，解压后运行 `FXXXXC.exe`：
+
+- 左侧导航：仪表盘 / 课程 / 任务 / 日志 / 设置；
+- 支持亮/暗主题与 Material You 强调色；
+- 学习进度、实时日志、手动答题弹窗、通知与题库测试；
+- 配置与日志保存在 `%APPDATA%\FXXXXC` 与 `%LOCALAPPDATA%\FXXXXC`，引擎仅监听 127.0.0.1 并使用随机端口 + Token 鉴权。
+
+### 3. Docker 运行
 
 ```bash
-python main.py -u 手机号 -p 密码 -l 课程ID1,课程ID2,课程ID3...(可选) -a [retry|ask|continue](可选)
+docker build -t fxxxxc .
+docker run -it -v /本地路径/config.ini:/config/config.ini fxxxxc
 ```
 
-> Tips:  
-> 如果已安装低版本 Python 推荐使用 `uv` 运行：
+容器默认使用挂载到 `/config/config.ini` 的配置；未挂载时自动复制模板。
+
+## :gear: 配置说明
+
+完整键位见 `config_template.ini`（与代码有键位一致性测试）。常用项：
+
+| 节 | 键 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `[common]` | `use_cookies` | `false` | true 时忽略账号密码 |
+| `[common]` | `course_list` | 空 | 课程 ID；**显式填写但无匹配会报错退出** |
+| `[common]` | `speed` / `jobs` | `1` / `4` | 倍速 / 并发章节 |
+| `[common]` | `notopen_action` | `retry` | retry / ask / continue |
+| `[common]` | `work_redo_enabled` / `work_max_retries` | `false` / `3` | 章节检测重做 |
+| `[common]` | `add_learning_count` / `target_count` / `learning_count_interval` | `false` / `100` / `30` | 章节学习次数 |
+| `[tiku]` | `provider` | `TikuYanxi` | 题库，可逗号分隔多题库回退 |
+| `[tiku]` | `submit` / `cover_rate` / `delay` | `false` / `0.9` / `1.0` | 提交模式与覆盖率 |
+| `[tiku]` | `endpoint` / `key` / `model` | 空 | AI（OpenAI 兼容） |
+| `[tiku]` | `insecure_skip_verify` | `false` | 显式关闭 TLS 校验（不建议） |
+| `[notification]` | `provider` / `url` / `tg_chat_id` | 空 | ServerChan / Qmsg / Bark / Telegram |
+
+提交模式：不配置题库视为不答题自动跳过章节检测；`submit=false` 只保存不提交；`submit=true` 达到 `cover_rate` 后提交。
+
+## :rocket: 构建（GitHub Actions，手动触发）
+
+构建不在本地进行。仓库提供单一工作流 `.github/workflows/ci.yml`：
+
+- 触发方式：仅 `workflow_dispatch`（Actions 页面手动 Run），推送不会自动触发；
+- 流程：Python 质量（ruff/mypy/bandit/pip-audit/pytest+coverage）→ Windows 测试 → Flutter 质量（analyze/test）→ Windows x64 构建（PyInstaller 引擎 + Flutter GUI）→ 便携 zip + SHA256；
+- 产物命名 `FXXXXC-windows-x64-<version>.zip`，可在 Run 页面下载，也可勾选创建 Release。
+
+## :heart: 参与贡献
+
+见 [CONTRIBUTING.md](./CONTRIBUTING.md)。提交前请运行：
 
 ```bash
-uv run --python 3.13 main.py
+pre-commit run --all-files
+pytest -q
 ```
 
-使用配置文件运行 ：
-```bash
-uv run --python 3.13 main.py -c config.ini
-```
+## :book: 文档
 
-### 打包文件运行
-1. 从最新[Releases](https://github.com/Samueli924/chaoxing/releases)中下载exe文件
-2. (可选直接运行) 双击运行即可
-3. (可选配置文件运行) 下载config_template.ini文件保存为config.ini文件，修改文件内的账号密码内容, 执行 `./chaoxing.exe -c config.ini`
-4. (可选命令行运行)`./chaoxing.exe -u "手机号" -p "密码" -l 课程ID1,课程ID2,课程ID3...(可选) -a [retry|ask|continue](可选)`
+- `config_template.ini`：全部配置键与默认值；
+- `api/README.md`：模块地图与兼容层说明；
+- 架构/ADR 等内部开发文档保留在本地 `docs/`（不入库）。
 
-### Docker运行
-1. 构建Docker镜像
-   ```bash
-   docker build -t chaoxing .
-   ```
+## :warning: 安全提示
 
-2. 运行Docker容器
-   ```bash
-   # 直接运行（将使用默认配置模板）
-   docker run -it chaoxing
-   
-   # 使用自定义配置文件运行
-   docker run -it -v /本地路径/config.ini:/config/config.ini chaoxing
-   ```
-
-3. 配置说明
-   - Docker版本默认使用挂载到 `/config/config.ini` 的配置文件
-   - 首次运行时，会自动将 `config_template.ini` 复制到该位置作为模板
-   - 可以将本地编辑好的配置文件挂载到容器中，按照上述示例命令操作
-
-### 题库配置说明
-
-在你的配置文件中找到`[tiku]`，按照注释填写想要使用的题库名（即`provider`，大小写要一致），并填写必要信息，如token，然后在启动时添加`-c [你的配置文件路径]`即可。
-
-题库会默认使用根目录下的`config.ini`文件中的配置，所以你可以复制配置模板（参照前面的说明）命名为`config.ini`，并只配置题库项`[tiku]`，这样即使你不填写账号之类的信息，不使用`-c`参数指定配置文件，题库也会根据这个配置文件自动配置并启用。
-
-对于那些有章节检测且任务点需要解锁的课程，必须配置题库。
-
-**提交模式与答题**
-不配置题库（既不提供配置文件，也没有放置默认配置文件`config.ini`或填写要使用的题库）视为不使用题库，对于章节检测等需要答题的任务会自动跳过。
-题库覆盖率：搜到的题目占总题目的比例
-提交模式`submit`值为
-
-- `true`：会答完题，达到题库题目覆盖率提交，没达到只保存，**正确率不做保证**。
-- `false`：会答题，但是不会提交，仅保存搜到答案的，随后你可以自行前往学习通查看、修改、提交。**任何填写不正确的`submit`值会被视为`false`**
-
-> 题库名即`answer.py`模块中根据`Tiku`类实现的具体题库类，例如`TikuYanxi`（言溪题库），在填写时，请务必保持大小写一致。
-
-### 已关闭任务点处理配置说明
-
-在配置文件的 `[common]` 部分，可以通过 `notopen_action` 选项配置遇到已关闭任务点时的处理方式:
-
-- `retry` (默认): 遇到关闭的任务点时尝试重新完成上一个任务点，如果连续重试 3 次仍然失败 (或未配置题库及自动提交) 则停止
-- `ask`: 遇到关闭的任务点时询问用户是否继续。选择继续后会自动跳过连续的关闭任务点，直到遇到开放的任务点
-- `continue`: 自动跳过所有关闭的任务点，继续检查和完成后续任务点
-
-也可以通过命令行参数 `-a` 或 `--notopen-action` 指定处理方式，例如：
-
-```bash
-python main.py -a ask  # 使用询问模式
-```
-
-### 章节学习次数配置说明
-
-在配置文件的 `[common]` 部分，可以通过下面两个选项控制章节学习次数功能：
-
-- `add_learning_count = false`：是否在完成刷课任务后，继续对课程章节执行学习次数增加
-- `target_count = 100`：章节学习次数的目标总次数，程序会轮询课程章节直到达到该次数
-
-当前实现会先完成所选课程的任务点，再统一执行章节学习次数增加流程。如果开启了 `add_learning_count`，它会作为刷课完成后的追加步骤执行，而不是独立模式。
-
-**外部通知配置说明**
-
-这功能会在所有课程学习任务结束后，或是程序出现错误时，使用外部通知服务推送消息告知你（~~有用但不多~~）
-
-与题库配置类似，不填写视为不使用，按照注释填写想要使用的外部通知服务（也是`provider`，大小写要一致），并填写必要的`url`
-
-## :heart: CONTRIBUTORS
-
-![Alt](https://repobeats.axiom.co/api/embed/d3931e84b4b2f17cbe60cafedb38114bdf9931cb.svg "Repobeats analytics image")  
-
-<a style="margin-top: 15px" href="https://github.com/Samueli924/chaoxing/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=Samueli924/chaoxing" />
-</a>
-
-## :warning: 免责声明
-- 本代码遵循 [GPL-3.0 License](https://github.com/Samueli924/chaoxing/blob/main/LICENSE) 协议，允许**开源/免费使用和引用/修改/衍生代码的开源/免费使用**，不允许**修改和衍生的代码作为闭源的商业软件发布和销售**，禁止**使用本代码盈利**，以此代码为基础的程序**必须**同样遵守 [GPL-3.0 License](https://github.com/Samueli924/chaoxing/blob/main/LICENSE) 协议
-- 本代码仅用于**学习讨论**，禁止**用于盈利**
-- 他人或组织使用本代码进行的任何**违法行为**与本人无关
+- `config.ini`、`cookies.txt`、`cache.json`、`chaoxing.log` 含账号/会话/题库 token，请勿提交或分享；
+- 日志会脱敏 cookie/token 等字段；如需完全关闭 TLS 校验，请显式设置 `insecure_skip_verify = true` 并自担风险；
+- 更多内容见 [SECURITY.md](./SECURITY.md)。
