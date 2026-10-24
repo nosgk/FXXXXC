@@ -13,6 +13,7 @@
 | 模块 | 职责 |
 | --- | --- |
 | `fxxxxc/paths.py` | 数据目录（CLI=cwd，桌面端=%APPDATA%/FXXXXC）与资源路径 |
+| `fxxxxc/config.py` | INI 读写助手（engine 与 GUI 共用） |
 | `fxxxxc/events.py` | 线程安全事件总线（引擎日志/进度/手动答题） |
 | `fxxxxc/cancellation.py` | 取消/暂停原语 |
 | `fxxxxc/infra/session.py` | 单次初始化的 `requests.Session` 单例（可 reset） |

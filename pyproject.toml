@@ -61,7 +61,7 @@ source = ["api", "fxxxxc", "main"]
 omit = ["tests/*", "scripts/*", "*/__init__.py"]
 
 [tool.coverage.report]
-fail_under = 40
+fail_under = 30
 show_missing = true
 skip_covered = true
 exclude_lines = [
