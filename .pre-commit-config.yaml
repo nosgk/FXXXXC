@@ -1,0 +1,38 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.10
+    hooks:
+      - id: ruff
+        files: ^(fxxxxc/|scripts/)
+        args: [--fix, --select, "E9,F63,F7,F82,I,UP,B"]
+      - id: ruff-format
+        files: ^(fxxxxc/|scripts/)
+        types_or: [python, pyi]
+        args: [--check]
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=2048]
+      - id: detect-private-key
+
+  - repo: local
+    hooks:
+      - id: python-compile
+        name: python compileall
+        entry: python -m compileall -q
+        language: system
+        types: [python]
+        pass_filenames: false
+      - id: forbid-internal-docs
+        name: forbid internal docs
+        entry: python scripts/check_no_internal_docs.py
+        language: system
+        pass_filenames: false
