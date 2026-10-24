@@ -24,8 +24,10 @@ def check_multiple(answer):
     return False
 
 
-def check_judgement(answer, true_list, false_list):
+def check_judgement(answer, true_list=None, false_list=None):
     val = str(answer).strip().lower()
+    true_list = true_list or []
+    false_list = false_list or []
     if val in ['true', 't', '1', '对', '正确', '√', '是', 'yes', 'y'] or val in [x.lower() for x in true_list]:
         return 1
     elif val in ['false', 'f', '0', '错', '错误', '×', '否', 'no', 'n', '不对', '不正确'] or val in [x.lower() for x in
@@ -36,10 +38,7 @@ def check_judgement(answer, true_list, false_list):
 
 
 def check_completion(answer):
-    if len(answer) > 0:
-        return True
-    else:
-        return False
+    return bool(str(answer or "").strip())
 
 
 def check_answer(answer, type, tiku):  # 只会写小杯代码，这里用个tiku感觉怪怪的，但先这么写着

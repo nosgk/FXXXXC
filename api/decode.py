@@ -35,16 +35,34 @@ def decode_course_list(html_text: str) -> List[Dict[str, str]]:
         if course.select_one("a.not-open-tip") or course.select_one("div.not-open-tip"):
             continue
 
+        clazz_input = course.select_one("input.clazzId")
+        course_input = course.select_one("input.courseId")
+        link = course.select_one("a")
+        name = course.select_one("span.course-name")
+        teacher = course.select_one("p.color3")
+        if not all((clazz_input, course_input, link, name, teacher)):
+            logger.warning("课程条目缺少必要字段，已跳过: {}", course.attrs.get("id", "?"))
+            continue
+
+        cpi_match = re.search(r"cpi=(.*?)&", link.attrs.get("href", ""))
+        if not cpi_match:
+            logger.warning("课程条目缺少 cpi 参数，已跳过: {}", course.attrs.get("id", "?"))
+            continue
+
         course_detail = {
-            "id": course.attrs["id"],
-            "info": course.attrs["info"],
-            "roleid": course.attrs["roleid"],
-            "clazzId": course.select_one("input.clazzId").attrs["value"],
-            "courseId": course.select_one("input.courseId").attrs["value"],
-            "cpi": re.findall(r"cpi=(.*?)&", course.select_one("a").attrs["href"])[0],
-            "title": course.select_one("span.course-name").attrs["title"],
-            "desc": course.select_one("p.margint10").attrs["title"] if course.select_one("p.margint10") else "",
-            "teacher": course.select_one("p.color3").attrs["title"]
+            "id": course.attrs.get("id", ""),
+            "info": course.attrs.get("info", ""),
+            "roleid": course.attrs.get("roleid", ""),
+            "clazzId": clazz_input.attrs.get("value", ""),
+            "courseId": course_input.attrs.get("value", ""),
+            "cpi": cpi_match.group(1),
+            "title": name.attrs.get("title", ""),
+            "desc": (
+                course.select_one("p.margint10").attrs.get("title", "")
+                if course.select_one("p.margint10")
+                else ""
+            ),
+            "teacher": teacher.attrs.get("title", ""),
         }
         course_list.append(course_detail)
 
@@ -70,9 +88,14 @@ def decode_course_folder(html_text: str) -> List[Dict[str, str]]:
         if not course.attrs.get("fileid"):
             continue
 
+        rename_input = course.select_one("input.rename-input")
+        if not rename_input:
+            logger.warning("课程文件夹缺少名称字段，已跳过: {}", course.attrs.get("fileid"))
+            continue
+
         course_folder_detail = {
             "id": course.attrs["fileid"],
-            "rename": course.select_one("input.rename-input").attrs["value"]
+            "rename": rename_input.attrs.get("value", ""),
         }
         course_folder_list.append(course_folder_detail)
 
@@ -123,11 +146,20 @@ def _extract_points_from_chapter(chapter_unit) -> List[Dict[str, Any]]:
 
     for raw_point in raw_points:
         point = raw_point.div
-        if "id" not in point.attrs:
+        if point is None or "id" not in point.attrs:
             continue
 
-        point_id = re.findall(r"^cur(\d{1,20})$", point.attrs["id"])[0]
-        point_title = point.select_one("a.clicktitle").text.replace("\n", "").strip()
+        id_match = re.match(r"^cur(\d{1,20})$", point.attrs["id"])
+        if not id_match:
+            logger.warning("章节点 ID 格式异常，已跳过: {}", point.attrs.get("id"))
+            continue
+        point_id = id_match.group(1)
+
+        title_tag = point.select_one("a.clicktitle")
+        if not title_tag:
+            logger.warning("章节点缺少标题，已跳过: {}", point_id)
+            continue
+        point_title = title_tag.text.replace("\n", "").strip()
 
         # 提取任务数量
         job_count = 1  # 默认为1
@@ -154,6 +186,49 @@ def _extract_points_from_chapter(chapter_unit) -> List[Dict[str, Any]]:
     return point_list
 
 
+def _extract_marg_json(html_text: str) -> Optional[str]:
+    """Extract the balanced JSON object following ``mArg=``.
+
+    The Chaoxing page embeds a JavaScript object literal. A non-greedy regex
+    stops at the first ``};`` inside a string, so this scanner tracks braces
+    and string escapes instead.
+    """
+    compact = html_text.replace(" ", "")
+    marker = "mArg="
+    start = compact.find(marker)
+    if start == -1:
+        return None
+    start += len(marker)
+    if start >= len(compact) or compact[start] != "{":
+        return None
+
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(compact)):
+        char = compact[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return compact[start : index + 1]
+
+    logger.warning("任务点 mArg JSON 括号不配对")
+    return None
+
+
 def decode_course_card(html_text: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
     解析任务点列表页面，提取任务点信息
@@ -170,13 +245,17 @@ def decode_course_card(html_text: str) -> Tuple[List[Dict[str, Any]], Dict[str, 
     if "章节未开放" in html_text:
         return [], {"notOpen": True}
 
-    # 提取mArg参数
-    temp = re.findall(r"mArg=\{(.*?)\};", html_text.replace(" ", ""))
-    if not temp:
+    # 提取 mArg 参数。用括号配对而不是非贪婪正则，避免 JSON 字符串中的
+    # "};" 提前截断。
+    raw_json = _extract_marg_json(html_text)
+    if not raw_json:
         return [], {}
 
-    # 解析JSON数据
-    cards_data = json.loads("{" + temp[0] + "}")
+    try:
+        cards_data = json.loads(raw_json)
+    except json.JSONDecodeError as exc:
+        logger.warning("任务点 mArg JSON 解析失败: {}", exc)
+        return [], {}
 
     if not cards_data:
         return [], {}
@@ -284,6 +363,10 @@ def _process_attachment_cards(cards: List[Dict[str, Any]]) -> List[Dict[str, Any
             work_job = _process_work_task(card)
             if work_job:
                 job_list.append(work_job)
+        elif card_type == "read":
+            read_job = _process_read_task(card)
+            if read_job:
+                job_list.append(read_job)
         else:
             logger.warning(f"Unknown card type: {card_type}")
             logger.warning(card)
@@ -403,7 +486,14 @@ def decode_questions_info(html_content: str) -> Dict[str, Any]:
 
     # 处理所有问题
     questions = []
-    for div_tag in soup.find("form").find_all("div", class_="singleQuesId"):
+    form_tag = soup.find("form")
+    if not form_tag:
+        logger.warning("题目页面未找到 form 标签，返回空题目列表")
+        form_data["questions"] = []
+        form_data["answerwqbid"] = ""
+        return form_data
+
+    for div_tag in form_tag.find_all("div", class_="singleQuesId"):
         question = _process_question(div_tag, font_decoder)
         if question:
             questions.append(question)
@@ -452,7 +542,11 @@ def _process_question(div_tag, font_decoder=None) -> Dict[str, Any]:
     """处理单个问题"""
     # 提取问题ID和题目类型
     question_id = div_tag.attrs.get("data", "")
-    q_type_code = div_tag.find("div", class_="TiMu").attrs.get("data", "")
+    timu = div_tag.find("div", class_="TiMu")
+    if not timu:
+        logger.warning("题目 {} 缺少 TiMu 容器，已跳过", question_id or "?")
+        return {}
+    q_type_code = timu.attrs.get("data", "")
     q_type = _get_question_type(q_type_code)
 
     # 提取题目内容和选项

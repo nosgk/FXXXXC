@@ -68,7 +68,13 @@ class CxCaptcha:
         'submit': '/html/processVerify.ac'
     }
 
-    def __init__(self, user_agent: str, cookies: str, ocr: Optional[DdddOcr] = _MISSING):
+    def __init__(
+        self,
+        user_agent: str,
+        cookies: str,
+        ocr: Optional[DdddOcr] = _MISSING,
+        verify: bool = True,
+    ):
         """
         初始化 CxCaptcha 实例。
 
@@ -86,7 +92,7 @@ class CxCaptcha:
             'Cookie': self.cookies,
             'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8'
         })
-        self.s.verify = False
+        self.s.verify = verify
 
         self.ocr = ocr_init() if ocr is _MISSING else ocr
 

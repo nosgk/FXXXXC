@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-import json
 import time
 
 from api.base import SessionManager
@@ -29,15 +28,27 @@ class Live:
             logger.error("缺少直播必要参数，无法提交时长")
             return False
 
-        # 构造时长记录请求URL（超星直播时长记录接口）
-        url = f"https://zhibo.chaoxing.com/saveTimePc?streamName={stream_name}&vdoid={vdoid}&userId={user_id}&isStart=0&t={int(time.time() * 1000)}&courseId={self.course_id}"
+        # 构造时长记录请求参数（超星直播时长记录接口）
+        params = {
+            "streamName": stream_name,
+            "vdoid": vdoid,
+            "userId": user_id,
+            "isStart": 0,
+            "t": int(time.time() * 1000),
+            "courseId": self.course_id,
+        }
 
         # 发送请求记录时长
         session = SessionManager.get_session()
         try:
-            response = session.get(url, headers=self.headers, timeout=10)
+            response = session.get(
+                "https://zhibo.chaoxing.com/saveTimePc",
+                params=params,
+                headers=self.headers,
+                timeout=10,
+            )
             response.raise_for_status()
-            logger.debug(f"直播时长提交响应: {response.text}")
+            logger.debug("直播时长提交响应: {}", response.text[:200])
             return response.text.strip() == "@success"  # 响应为@success表示提交成功
         except Exception as e:
             logger.error(f"提交直播时长失败: {str(e)}")
@@ -54,15 +65,28 @@ class Live:
             logger.error("缺少直播状态查询必要参数")
             return None
 
-        # 构造直播状态请求URL
-        status_url = f"https://mooc1.chaoxing.com/ananas/live/liveinfo?liveid={live_id}&userid={user_id}&clazzid={clazz_id}&knowledgeid={knowledge_id}&courseid={self.course_id}&jobid={self.attachment.get('property', {}).get('_jobid', '')}&ut=s"
+        # 构造直播状态请求参数
+        params = {
+            "liveid": live_id,
+            "userid": user_id,
+            "clazzid": clazz_id,
+            "knowledgeid": knowledge_id,
+            "courseid": self.course_id,
+            "jobid": self.attachment.get("property", {}).get("_jobid", ""),
+            "ut": "s",
+        }
 
         # 发送请求并解析状态（包含总时长）
         session = SessionManager.get_session()
         try:
-            response = session.get(status_url, headers=self.headers, timeout=10)
+            response = session.get(
+                "https://mooc1.chaoxing.com/ananas/live/liveinfo",
+                params=params,
+                headers=self.headers,
+                timeout=10,
+            )
             response.raise_for_status()
-            return json.loads(response.text)  # 返回包含总时长的状态字典
+            return response.json()  # 返回包含总时长的状态字典
         except Exception as e:
             logger.error(f"获取直播状态失败: {str(e)}")
             return None

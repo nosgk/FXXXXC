@@ -67,13 +67,19 @@ class FontDecoder:
         Returns:
             解码后的字符串
             
-        Raises:
-            ValueError: 当字体映射未初始化时抛出
+        Note:
+            字体映射不可用时返回原文而不是抛异常，避免单页字体解析失败
+            拖垮整章。调用方仍会收到警告日志。
         """
         if not self.__font_map:
-            raise FontDecodeError("字体映射未初始化，无法解码")
+            logger.warning("字体映射未初始化，跳过字体解码并保留原文")
+            return target_str
 
-        return cxfont.decrypt(self.__font_map, target_str)
+        try:
+            return cxfont.decrypt(self.__font_map, target_str)
+        except Exception as exc:  # noqa: BLE001 - decode is best effort
+            logger.warning(f"字体解码失败，保留原文: {exc}")
+            return target_str
 
     def set_html_content(self, html_content: str) -> None:
         """设置新的HTML内容并重新初始化字体映射。

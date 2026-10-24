@@ -1,7 +1,10 @@
+import os
 import sys
 
 from loguru import logger
 from tqdm import tqdm
+
+from api.config import GlobalConst as gc
 
 tqdm_stream = sys.stderr
 
@@ -33,6 +36,12 @@ def tqdm_sink(msg):
     tqdm_stream.flush()
 
 
+log_level = os.environ.get("FXXXXC_LOG_LEVEL", "TRACE").upper()
+try:
+    os.makedirs(os.path.dirname(gc.LOG_PATH) or ".", exist_ok=True)
+except OSError:
+    pass
+
 logger.remove()
 logger.add(tqdm_sink, colorize=True, enqueue=True)
-logger.add("chaoxing.log", rotation="10 MB", level="TRACE")
+logger.add(gc.LOG_PATH, rotation="10 MB", level=log_level)

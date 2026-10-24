@@ -1,7 +1,21 @@
 # -*- coding: utf-8 -*-
+import os
+
+
+def _data_dir() -> str:
+    return os.path.abspath(os.environ.get("FXXXXC_DATA_DIR") or os.getcwd())
+
+
 class GlobalConst:
     AESKey = "u2oh6Vu^HWe4_AES"
-    COOKIES_PATH = "cookies.txt"
+
+    # Legacy CLI paths stay relative to the current directory unless the
+    # caller sets FXXXXC_DATA_DIR (the desktop engine always does).
+    DATA_DIR = _data_dir()
+    CONFIG_PATH = os.path.join(DATA_DIR, "config.ini")
+    COOKIES_PATH = os.path.join(DATA_DIR, "cookies.txt")
+    CACHE_PATH = os.path.join(DATA_DIR, "cache.json")
+    LOG_PATH = os.path.join(DATA_DIR, "chaoxing.log")
 
     HEADERS = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",

@@ -18,6 +18,8 @@ from openai import OpenAI
 from urllib3 import disable_warnings, exceptions
 
 from api.answer_check import check_answer
+from api.config import GlobalConst as gc
+from fxxxxc.tiku.cache import CacheDAO
 from api.logger import logger
 
 # 关闭警告
@@ -27,118 +29,15 @@ __all__ = ["CacheDAO", "Tiku", "TikuFallback", "TikuYanxi", "TikuGo", "TikuLike"
            "TikuManual"]
 
 
-class CacheDAO:
-    """
-    @Author: SocialSisterYi
-    @Reference: https://github.com/SocialSisterYi/xuexiaoyi-to-xuexitong-tampermonkey-proxy
-    """
-    DEFAULT_CACHE_FILE = "cache.json"
-
-    def __init__(self, file: str = DEFAULT_CACHE_FILE):
-        self.cache_file = Path(file)
-        self._lock = threading.RLock()
-        if not self.cache_file.is_file():
-            self._write_cache({})
-
-    def _read_cache(self) -> dict:
-        # 新增缓存文件读取的异常处理
-        try:
-            with self._lock:
-                if not self.cache_file.is_file():
-                    return {}
-                try:
-                    with self.cache_file.open("r", encoding="utf8") as fp:
-                        return json.load(fp)
-                except json.JSONDecodeError as e:
-                    logger.error(f"缓存文件 JSON 解析失败: {e}, 尝试恢复...")
-                    # 尝试从原始二进制中以 utf-8 忽略错误地恢复有效 JSON 段
-                    try:
-                        raw = self.cache_file.read_bytes()
-                        text = raw.decode("utf-8", errors="ignore")
-                        start = text.find('{')
-                        end = text.rfind('}')
-                        if start != -1 and end != -1 and start < end:
-                            try:
-                                return json.loads(text[start:end + 1])
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-                    # 若无法恢复，备份损坏文件并返回空缓存
-                    try:
-                        bak_name = f"{self.cache_file.name}.bak.{int(time.time())}"
-                        bak_path = self.cache_file.with_name(bak_name)
-                        shutil.copy2(self.cache_file, bak_path)
-                        logger.error(f"缓存文件已损坏，已备份为: {bak_path}，将使用空缓存继续运行")
-                    except Exception as ex:
-                        logger.error(f"备份损坏缓存失败: {ex}")
-                    return {}
-                except UnicodeDecodeError as e:
-                    logger.error(f"缓存文件编码读取失败: {e}, 采用恢复策略...")
-                    try:
-                        raw = self.cache_file.read_bytes()
-                        text = raw.decode("utf-8", errors="ignore")
-                        start = text.find('{')
-                        end = text.rfind('}')
-                        if start != -1 and end != -1 and start < end:
-                            try:
-                                return json.loads(text[start:end + 1])
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-                    try:
-                        bak_name = f"{self.cache_file.name}.bak.{int(time.time())}"
-                        bak_path = self.cache_file.with_name(bak_name)
-                        shutil.copy2(self.cache_file, bak_path)
-                        logger.error(f"缓存文件编码错误，已备份为: {bak_path}，将使用空缓存继续运行")
-                    except Exception as ex:
-                        logger.error(f"备份损坏缓存失败: {ex}")
-                    return {}
-        except Exception as e:
-            logger.error(f"读取缓存异常: {e}")
-            return {}
-
-    def _write_cache(self, data: dict) -> None:
-        # 为缓存写入加锁，防止并发写入损坏文件
-        try:
-            with self._lock:
-                parent = self.cache_file.parent
-                if not parent.exists():
-                    parent.mkdir(parents=True, exist_ok=True)
-                # 写入临时文件后原子替换，减少并发写入时的损坏风险
-                fd, tmp_path = tempfile.mkstemp(prefix=self.cache_file.name, dir=str(parent))
-                try:
-                    with os.fdopen(fd, "w", encoding="utf8") as fp:
-                        json.dump(data, fp, ensure_ascii=False, indent=4)
-                        fp.flush()
-                        os.fsync(fp.fileno())
-                    os.replace(tmp_path, str(self.cache_file))
-                except Exception as e:
-                    # 清理临时文件
-                    try:
-                        if os.path.exists(tmp_path):
-                            os.remove(tmp_path)
-                    except Exception:
-                        pass
-                    logger.error(f"Failed to write cache atomically: {e}")
-        except IOError as e:
-            logger.error(f"Failed to write cache: {e}")
-
-    def get_cache(self, question: str) -> Optional[str]:
-        data = self._read_cache()
-        return data.get(question)
-
-    def add_cache(self, question: str, answer: str) -> None:
-        # 为缓存写入加锁，防止并发写入损坏文件
-        with self._lock:
-            data = self._read_cache()
-            data[question] = answer
-            self._write_cache(data)
+def options_text(options) -> str:
+    """Normalize provider question options to a newline-separated string."""
+    if isinstance(options, list):
+        return "\n".join(str(item) for item in options)
+    return str(options or "")
 
 
 class Tiku(ABC):
-    CONFIG_PATH = os.path.join(os.getcwd(), "config.ini")
+    CONFIG_PATH = gc.CONFIG_PATH
     DISABLE = False  # 停用标志
     SUBMIT = False  # 提交标志
     COVER_RATE = 0.8  # 覆盖率
@@ -183,19 +82,48 @@ class Tiku(ABC):
     def token(self, value):
         self._token = value
 
+    @staticmethod
+    def _as_bool(value, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+    def _tls_verify(self) -> bool:
+        """Return requests' ``verify`` value; TLS verification is on by default."""
+        insecure = False
+        if self._conf:
+            insecure = self._as_bool(self._conf.get("insecure_skip_verify"), False)
+        if os.environ.get("FXXXXC_INSECURE_SKIP_VERIFY"):
+            insecure = self._as_bool(os.environ["FXXXXC_INSECURE_SKIP_VERIFY"], insecure)
+        return not insecure
+
     def init_tiku(self):
         # 仅用于题库初始化, 应该在题库载入后作初始化调用, 随后才可以使用题库
         # 尝试根据配置文件设置提交模式
         if not self._conf:
             self.config_set(self._get_conf())
-        if not self.DISABLE:
-            # 设置提交模式
-            self.SUBMIT = True if self._conf['submit'] == 'true' else False
-            self.COVER_RATE = float(self._conf['cover_rate'])
-            self.true_list = self._conf['true_list'].split(',')
-            self.false_list = self._conf['false_list'].split(',')
-            # 调用自定义题库初始化
+        if self.DISABLE:
+            return
+
+        conf = self._conf or {}
+        self.SUBMIT = self._as_bool(conf.get("submit"), False)
+        try:
+            self.COVER_RATE = float(conf.get("cover_rate", self.COVER_RATE))
+        except (TypeError, ValueError):
+            logger.warning("cover_rate 配置无效, 使用默认值 {}", self.COVER_RATE)
+
+        true_list = conf.get("true_list", "正确,对,√,是")
+        false_list = conf.get("false_list", "错误,错,×,否,不对,不正确")
+        self.true_list = [item.strip() for item in str(true_list).split(",") if item.strip()]
+        self.false_list = [item.strip() for item in str(false_list).split(",") if item.strip()]
+
+        try:
             self._init_tiku()
+        except Exception as exc:  # noqa: BLE001 - a broken provider must not crash the app
+            logger.error("题库 {} 初始化失败: {}", self.name or self.__class__.__name__, exc)
+            self.DISABLE = True
 
     def _init_tiku(self):
         # 仅用于题库初始化, 例如配置token, 交由自定义题库完成
@@ -227,11 +155,8 @@ class Tiku(ABC):
                     getattr(self, 'providers', [])))
         )
 
-    def query(self, q_info: dict) -> Optional[str]:
-        if self.DISABLE:
-            return None
-
-        # 预处理, 去除【单选题】这样与标题无关的字段
+    def _prepare_question(self, q_info: dict) -> None:
+        """Normalize a question title in place before cache/query."""
         if not self._is_manual_mode:
             logger.debug(f"原始标题：{q_info['title']}")
         q_info['title'] = sub(r'^\d+', '', q_info['title'])
@@ -239,29 +164,35 @@ class Tiku(ABC):
         if not self._is_manual_mode:
             logger.debug(f"处理后标题：{q_info['title']}")
 
-        # 先过缓存（若存在章节检测错误反馈，说明处于重做模式，跳过缓存让大模型参考反馈重新作答）
-        if not getattr(self, 'work_feedback', None):
-            cache_dao = CacheDAO()
-            answer = cache_dao.get_cache(q_info['title'])
-            if answer:
-                logger.info(f"从缓存中获取答案：{q_info['title']} -> {answer}")
-                return answer.strip()
-            else:
-                answer = self._query(q_info)
-        else:
-            answer = self._query(q_info)
-            if answer:
-                answer = answer.strip()
-                logger.info(f"从{self.name}获取答案：{q_info['title']} -> {answer}")
-                if check_answer(answer, q_info['type'], self):
-                    cache_dao.add_cache(q_info['title'], answer)
-                    return answer
-                else:
-                    logger.info(f"从{self.name}获取到的答案类型与题目类型不符，已舍弃")
-                    return None
+    def query(self, q_info: dict) -> Optional[str]:
+        if self.DISABLE:
+            return None
 
+        self._prepare_question(q_info)
+        cache_dao = CacheDAO()
+        skip_cache = bool(getattr(self, 'work_feedback', None))
+
+        if not skip_cache:
+            cached = cache_dao.get_cache(q_info['title'])
+            if cached:
+                logger.info(f"从缓存中获取答案：{q_info['title']} -> {cached}")
+                return cached.strip()
+
+        answer = self._query(q_info)
+        if not answer:
             logger.error(f"从{self.name}获取答案失败：{q_info['title']}")
-        return None
+            return None
+
+        answer = answer.strip()
+        logger.info(f"从{self.name}获取答案：{q_info['title']} -> {answer}")
+        if not check_answer(answer, q_info['type'], self):
+            logger.info(f"从{self.name}获取到的答案类型与题目类型不符，已舍弃")
+            return None
+
+        # 重做模式不写缓存，避免把未经人工确认的答案固化下来。
+        if not skip_cache:
+            cache_dao.add_cache(q_info['title'], answer)
+        return answer
 
     def query_all(self, q_list: list[dict], query_delay: float = 0.0) -> list[Optional[str]]:
         if self.DISABLE:
@@ -273,12 +204,7 @@ class Tiku(ABC):
         cache_dao = CacheDAO()
         skip_cache = bool(getattr(self, 'work_feedback', None))
         for idx, q in enumerate(q_list):
-            if not self._is_manual_mode:
-                logger.debug(f"原始标题：{q['title']}")
-            q['title'] = sub(r'^\d+', '', q['title'])
-            q['title'] = sub(r'（\d+\.\d+分）$', '', q['title'])
-            if not self._is_manual_mode:
-                logger.debug(f"处理后标题：{q['title']}")
+            self._prepare_question(q)
 
             if skip_cache:
                 # 重做模式：不走缓存，让大模型参考错误反馈重新作答
@@ -308,19 +234,23 @@ class Tiku(ABC):
             sub_results = list(sub_results) + [None] * (len(pending_indices) - len(sub_results))
             sub_results = sub_results[:len(pending_indices)]
 
+        to_cache: dict[str, str] = {}
         for idx, ans in zip(pending_indices, sub_results):
             q_info = q_list[idx]
             if ans:
                 ans = ans.strip()
                 logger.info(f"从{self.name}获取答案：{q_info['title']} -> {ans}")
                 if check_answer(ans, q_info['type'], self):
-                    cache_dao.add_cache(q_info['title'], ans)
+                    if not skip_cache:
+                        to_cache[q_info['title']] = ans
                     results[idx] = ans
                 else:
                     logger.info(f"从{self.name}获取到的答案类型与题目类型不符，已舍弃")
             else:
                 logger.error(f"从{self.name}获取答案失败：{q_info['title']}")
 
+        if to_cache:
+            cache_dao.add_many(to_cache)
         return results
 
     @abstractmethod
@@ -579,34 +509,49 @@ class TikuYanxi(Tiku):
         self._times = 100  # 查询次数剩余, 初始化为100, 查询后校对修正
 
     def _query(self, q_info: dict):
-        res = requests.get(
-            self.api,
-            params={
-                'question': q_info['title'],
-                'token': self._token,
-                # 'type':q_info['type'], #修复478题目类型与答案类型不符（不想写后处理了）
-                # 没用，就算有type和options，言溪题库还是可能返回类型不符，问了客服，type仅用于收集
-            },
-            verify=False
-        )
-        if res.status_code == 200:
+        try:
+            res = requests.get(
+                self.api,
+                params={
+                    'question': q_info['title'],
+                    'token': self._token,
+                    # 'type':q_info['type'], #修复478题目类型与答案类型不符（不想写后处理了）
+                    # 没用，就算有type和options，言溪题库还是可能返回类型不符，问了客服，type仅用于收集
+                },
+                verify=self._tls_verify(),
+                timeout=15,
+            )
+        except requests.RequestException as exc:
+            logger.error(f'{self.name}查询异常: {exc}')
+            return None
+
+        if res.status_code != 200:
+            logger.error(f'{self.name}查询失败:\n{res.text[:200]}')
+            return None
+
+        try:
             res_json = res.json()
-            if not res_json['code']:
-                # 如果是因为TOKEN次数到期, 则更换token
-                if self._times == 0 or '次数不足' in res_json['data']['answer']:
-                    logger.info(f'TOKEN查询次数不足, 将会更换并重新搜题')
-                    self._token_index += 1
-                    self.load_token()
-                    # 重新查询
-                    return self._query(q_info)
-                logger.error(
-                    f'{self.name}查询失败:\n\t剩余查询数{res_json["data"].get("times", f"{self._times}(仅参考)")}:\n\t消息:{res_json["message"]}')
-                return None
-            self._times = res_json["data"].get("times", self._times)
-            return res_json['data']['answer'].strip()
-        else:
-            logger.error(f'{self.name}查询失败:\n{res.text}')
-        return None
+        except ValueError:
+            logger.error(f'{self.name}返回非 JSON 内容: {res.text[:200]}')
+            return None
+
+        data = res_json.get('data') or {}
+        if not res_json.get('code'):
+            # 如果是因为TOKEN次数到期, 则更换token
+            if self._times == 0 or '次数不足' in str(data.get('answer', '')):
+                logger.info('TOKEN查询次数不足, 将会更换并重新搜题')
+                self._token_index += 1
+                self.load_token()
+                # 重新查询
+                return self._query(q_info)
+            logger.error(
+                f'{self.name}查询失败:\n\t剩余查询数{data.get("times", f"{self._times}(仅参考)")}:\n\t消息:{res_json.get("message", "")}'
+            )
+            return None
+
+        self._times = data.get("times", self._times)
+        answer = str(data.get("answer", "")).strip()
+        return answer or None
 
     def load_token(self):
         token_list = self._conf['tokens'].split(',')
@@ -820,11 +765,15 @@ class TikuLike(Tiku):
 
         q_info_map = {"single": "【单选题】", "multiple": "【多选题】", "completion": "【填空题】", "judgement": "【判断题】"}
         q_info_prefix = q_info_map.get(q_info['type'], "【其他类型题目】")
-        options = ', '.join(q_info['options']) if isinstance(q_info['options'], list) else q_info['options']
+        options = options_text(q_info.get('options'))
         question = f"{q_info_prefix}{q_info['title']}\n"
 
         if q_info['type'] in ['single', 'multiple']:
             question += f"选项为: {options}\n"
+
+        if not self._tokens:
+            logger.error(f'{self.name}没有可用的Token')
+            return None
 
         # 随机选择一个token进行查询
         token = random.choice(self._tokens)
@@ -899,7 +848,7 @@ class TikuLike(Tiku):
                 self.query_api,
                 json=request_data,
                 headers=temp_headers,
-                verify=False,
+                verify=self._tls_verify(),
                 timeout=self._timeout  # 添加超时设置
             )
         except requests.exceptions.Timeout:
@@ -1049,7 +998,7 @@ class TikuLike(Tiku):
             res = requests.get(
                 self.balance_api,
                 headers=temp_headers,
-                verify=False,
+                verify=self._tls_verify(),
                 timeout=self._timeout
             )
             if res.status_code == 200:
@@ -1134,29 +1083,41 @@ class TikuAdapter(Tiku):
         else:
             type = 4
 
-        options = q_info['options']
-        res = requests.post(
-            self.api,
-            json={
-                'question': q_info['title'],
-                'options': [sub(r'^[A-Za-z]\.?、?\s?', '', option) for option in options.split('\n')],
-                'type': type
-            },
-            verify=False
-        )
-        if res.status_code == 200:
+        options = options_text(q_info.get('options'))
+        try:
+            res = requests.post(
+                self.api,
+                json={
+                    'question': q_info['title'],
+                    'options': [
+                        sub(r'^[A-Za-z]\.?、?\s?', '', option)
+                        for option in options.split('\n')
+                        if option.strip()
+                    ],
+                    'type': type,
+                },
+                verify=self._tls_verify(),
+                timeout=15,
+            )
+        except requests.RequestException as exc:
+            logger.error(f'{self.name}查询异常: {exc}')
+            return None
+
+        if res.status_code != 200:
+            logger.error(f'{self.name}查询失败: HTTP {res.status_code}')
+            return None
+
+        try:
             res_json = res.json()
-            # if bool(res_json['plat']):
-            # plat无论搜没搜到答案都返回0
-            # 这个参数是tikuadapter用来设定自定义的平台类型
-            if not len(res_json['answer']['bestAnswer']):
-                logger.error("查询失败, 返回：" + res.text)
-                return None
-            sep = "\n"
-            return sep.join(res_json['answer']['bestAnswer']).strip()
-        # else:
-        #   logger.error(f'{self.name}查询失败:\n{res.text}')
-        return None
+        except ValueError:
+            logger.error(f'{self.name}返回非 JSON 内容: {res.text[:200]}')
+            return None
+
+        best = (res_json.get('answer') or {}).get('bestAnswer') or []
+        if not best:
+            logger.error(f'{self.name}查询失败, 返回：{res.text[:200]}')
+            return None
+        return "\n".join(str(item) for item in best).strip()
 
     def _init_tiku(self):
         # self.load_token()
@@ -1172,6 +1133,8 @@ class AI(Tiku):
         self.last_request_time = None
         self._lock = threading.Lock()
         self.work_feedback = None  # 章节检测错误反馈（重做时参考）
+        self._client = None
+        self._client_key = None
 
     def set_work_feedback(self, feedback) -> None:
         """
@@ -1217,6 +1180,23 @@ class AI(Tiku):
                 logger.debug(f"API请求间隔过短, 等待 {sleep_time} 秒")
                 time.sleep(sleep_time)
 
+    def _get_client(self):
+        """Reuse one OpenAI client per endpoint/key/proxy combination."""
+        key = (self.endpoint, self.key, self.http_proxy)
+        if self._client is not None and self._client_key == key:
+            return self._client
+        if self.http_proxy:
+            httpx_client = httpx.Client(proxy=self.http_proxy)
+            self._client = OpenAI(
+                http_client=httpx_client,
+                base_url=self.endpoint,
+                api_key=self.key,
+            )
+        else:
+            self._client = OpenAI(base_url=self.endpoint, api_key=self.key)
+        self._client_key = key
+        return self._client
+
     def _query(self, q_info: dict):
         with self._lock:
             return self._query_locked(q_info)
@@ -1228,14 +1208,9 @@ class AI(Tiku):
             match = re.search(pattern, md_str, re.DOTALL)
             return match.group(1).strip() if match else md_str.strip()
 
-        if self.http_proxy:
-            proxy = self.http_proxy
-            httpx_client = httpx.Client(proxy=proxy)
-            client = OpenAI(http_client=httpx_client, base_url=self.endpoint, api_key=self.key)
-        else:
-            client = OpenAI(base_url=self.endpoint, api_key=self.key)
+        client = self._get_client()
         # 去除选项字母，防止大模型直接输出字母而非内容
-        options_list = q_info['options'].split('\n')
+        options_list = options_text(q_info.get("options")).split("\n")
         cleaned_options = [re.sub(r"^[A-Z]\s*", "", option) for option in options_list]
         options = "\n".join(cleaned_options)
 
@@ -1313,8 +1288,8 @@ class AI(Tiku):
             response = json.loads(remove_md_json_wrapper(completion.choices[0].message.content))
             sep = "\n"
             return sep.join(response['Answer']).strip()
-        except:
-            logger.error("无法解析大模型输出内容")
+        except (ValueError, KeyError, TypeError, IndexError) as exc:
+            logger.error("无法解析大模型输出内容: {}", exc)
             return None
 
     def _init_tiku(self):
@@ -1332,12 +1307,7 @@ class AI(Tiku):
         with self._lock:
             logger.info(f'正在检查 {self.name} 连接...')
             try:
-                # 初始化客户端
-                if self.http_proxy:
-                    httpx_client = httpx.Client(proxy=self.http_proxy)
-                    client = OpenAI(http_client=httpx_client, base_url=self.endpoint, api_key=self.key)
-                else:
-                    client = OpenAI(base_url=self.endpoint, api_key=self.key)
+                client = self._get_client()
 
                 # 限流等待
                 self._wait_for_interval()
@@ -1413,6 +1383,8 @@ class SiliconFlow(Tiku):
             system_prompt = "本题为填空题，请直接给出填空内容，以JSON格式输出：示例回答：{\"Answer\": [\"答案文本\"]}。除此之外不要输出任何多余的内容，也不要使用MD语法。如果你使用了互联网搜索，也请不要返回搜索的结果和参考资料"
         elif q_info['type'] == 'judgement':
             system_prompt = "本题为判断题，请回答'正确'或'错误'，以JSON格式输出：示例回答：{\"Answer\": [\"正确\"]}。除此之外不要输出任何多余的内容，也不要使用MD语法。如果你使用了互联网搜索，也请不要返回搜索的结果和参考资料"
+        else:
+            system_prompt = "本题为简答题，请根据题目给出简洁准确的答案，以JSON格式输出：示例回答：{\"Answer\": [\"答案文本\"]}。除此之外不要输出任何多余的内容，也不要使用MD语法。如果你使用了互联网搜索，也请不要返回搜索的结果和参考资料"
 
         # 构造请求体
         payload = {
@@ -1424,7 +1396,7 @@ class SiliconFlow(Tiku):
                 },
                 {
                     "role": "user",
-                    "content": f"题目：{q_info['title']}\n选项：{q_info['options']}"
+                    "content": f"题目：{q_info['title']}\n选项：{options_text(q_info.get('options'))}"
                 }
             ],
             "stream": False,
