@@ -1,16 +1,24 @@
+import base64
 import configparser
+import hashlib
+import html
+import ipaddress
 import json
+import mimetypes
 import os
 import random
 import re
 import shutil
+import socket
 import tempfile
 import threading
 import time
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from pathlib import Path
 from re import sub
 from typing import Optional
+from urllib.parse import urljoin, urlparse, urlunparse
 
 import httpx
 import requests
@@ -24,6 +32,256 @@ from api.logger import logger
 
 # 关闭警告
 disable_warnings(exceptions.InsecureRequestWarning)
+
+_IMAGE_TAG_RE = re.compile(
+    r"<img\b[^>]*\bsrc\s*=\s*(['\"])(.*?)\1[^>]*>",
+    re.IGNORECASE,
+)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _has_image(q_info: dict) -> bool:
+    """Return whether a question or its options contain an image tag."""
+    return bool(_IMAGE_TAG_RE.search(str(q_info.get('title', '')) + str(q_info.get('options', ''))))
+
+
+def _image_choice(q_info: dict) -> bool:
+    """Select letter-mode answering for choices with image-bearing content."""
+    # 题干图片和选项图片都可能承载公式；统一要求模型返回选项字母，
+    # 避免把视觉识别出的公式正文拿去和选项文本匹配。
+    return q_info.get('type') in {'single', 'multiple'} and _has_image(q_info)
+
+
+def _choice_letters(answer, q_info: dict) -> str:
+    """只接受明确的选项字母，禁止从公式或说明文字中猜测选项."""
+    if not isinstance(answer, str):
+        return ''
+    compact = re.sub(r'[\s,，、;；]+', '', answer).upper()
+    if not re.fullmatch(r'[A-Z]+', compact):
+        return ''
+    valid = {m.group(1) for option in str(q_info.get('options', '')).splitlines()
+             if (m := re.match(r'^\s*([A-Z])(?:\s|[.、:：)]|<)', option))}
+    letters = ''.join(sorted(set(compact)))
+    if not letters or not set(letters) <= valid:
+        return ''
+    if q_info['type'] == 'single' and len(letters) != 1:
+        return ''
+    return letters
+
+
+def _question_cache_key(q_info: dict) -> str:
+    """Key image answers by type and options, excluding unsafe legacy caches."""
+    # 旧图题缓存存的是公式正文，无法和图片选项匹配。独立命名且包含选项，
+    # 同一题目换选项顺序时也必须重新查询。
+    if _has_image(q_info):
+        payload = json.dumps([q_info.get('type'), q_info.get('title', ''), q_info.get('options', '')],
+                             ensure_ascii=False)
+        return 'vision-choices-v3:' + hashlib.sha256(payload.encode('utf-8')).hexdigest()
+    return str(q_info.get('title', ''))
+
+
+_MAX_IMAGE_BYTES = 10 * 1024 * 1024
+
+
+def _public_image_address(hostname: str, port: int) -> str:
+    """Resolve once, reject non-public results, and return a numeric address."""
+    try:
+        try:
+            addresses = [ipaddress.ip_address(hostname)]
+        except ValueError:
+            records = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+            addresses = [ipaddress.ip_address(record[4][0]) for record in records]
+    except (OSError, ValueError) as exc:
+        raise ValueError("cannot resolve image destination") from exc
+    if not addresses:
+        raise ValueError("image destination has no addresses")
+    for address in addresses:
+        if not address.is_global or address.is_multicast:
+            raise ValueError("image destination is not public")
+        if isinstance(address, ipaddress.IPv6Address):
+            # Transition addresses can tunnel to non-public IPv4 destinations.
+            if address.sixtofour or address.teredo or address in ipaddress.ip_network('64:ff9b::/96'):
+                raise ValueError("image destination uses an IPv6 transition address")
+    # Prefer IPv4 when available; do not resolve the hostname again to connect.
+    return str(next((address for address in addresses if address.version == 4), addresses[0]))
+
+
+class _PublicImageAdapter(requests.adapters.HTTPAdapter):
+    """Pin HTTPS connections to public IPs while retaining hostname TLS checks."""
+
+    def get_connection_with_tls_context(self, request, verify, proxies=None, cert=None):
+        """Validate this hop and use its numeric IP for the connection pool."""
+        parsed = urlparse(request.url)
+        if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password:
+            raise ValueError("unsupported image destination")
+        if verify is False or any((proxies or {}).values()):
+            raise ValueError("image downloads require direct verified HTTPS")
+        port = parsed.port or 443
+        address = _public_image_address(parsed.hostname, port)
+        host_params, pool_kwargs = self.build_connection_pool_key_attributes(request, verify, cert)
+        host_params['host'] = address
+        pool_kwargs.update(server_hostname=parsed.hostname, assert_hostname=parsed.hostname)
+        request.headers['Host'] = parsed.netloc
+        return self.poolmanager.connection_from_host(**host_params, pool_kwargs=pool_kwargs)
+
+
+@contextmanager
+def _get_image_response(url: str, **kwargs):
+    """Keep the pinned session and streaming response open until the hop ends."""
+    with requests.Session() as session:
+        # Proxies could resolve the original hostname again and bypass pinning.
+        # Also disable implicit netrc credentials for untrusted image URLs.
+        session.trust_env = False
+        session.mount('https://', _PublicImageAdapter())
+        with session.get(url, **kwargs) as response:
+            yield response
+
+
+def _is_chaoxing_host(hostname: Optional[str]) -> bool:
+    """Return whether a hostname belongs to chaoxing.com."""
+    host = (hostname or '').rstrip('.').lower()
+    return host == 'chaoxing.com' or host.endswith('.chaoxing.com')
+
+
+def _chaoxing_cookie_jar(cookies: dict) -> requests.cookies.RequestsCookieJar:
+    """Build a cookie jar scoped to Chaoxing's domain and path."""
+    jar = requests.cookies.RequestsCookieJar()
+    for name, value in cookies.items():
+        jar.set(name, value, domain='.chaoxing.com', path='/')
+    return jar
+
+
+def _inline_image_data_url(image_url: str) -> Optional[str]:
+    if not image_url.lower().startswith("data:"):
+        return None
+    try:
+        header, encoded = image_url.split(',', 1)
+        if not header.lower().startswith('data:image/') or not header.lower().endswith(';base64'):
+            return None
+        if len(encoded) > ((_MAX_IMAGE_BYTES + 2) // 3) * 4:
+            return None
+        content = base64.b64decode(encoded, validate=True)
+        return image_url if content and len(content) <= _MAX_IMAGE_BYTES else None
+    except ValueError:
+        return None
+
+
+def _image_response_data_url(response, current_url: str) -> str:
+    response.raise_for_status()
+    content_type_header = response.headers.get("Content-Type", "")
+    content_types = [part.strip().lower() for part in re.split(r"[,;]", content_type_header)]
+    content_type = next((part for part in content_types if part.startswith("image/")), "")
+    if not content_type:
+        guessed_type = mimetypes.guess_type(current_url)[0] or ""
+        content_type = guessed_type.lower() if guessed_type.startswith("image/") else ""
+    if not content_type.startswith("image/"):
+        raise ValueError("image response is not an image")
+    if response.headers.get('Content-Encoding', '').lower() not in {'', 'identity'}:
+        raise ValueError("compressed image response is unsupported")
+    size_header = response.headers.get('Content-Length', '')
+    if size_header.isdigit() and int(size_header) > _MAX_IMAGE_BYTES:
+        raise ValueError("image exceeds size limit")
+    content = bytearray()
+    for chunk in response.iter_content(chunk_size=64 * 1024):
+        if len(content) + len(chunk) > _MAX_IMAGE_BYTES:
+            raise ValueError("image exceeds size limit")
+        content.extend(chunk)
+    if not content:
+        raise ValueError("image is empty")
+    encoded = base64.b64encode(content).decode("ascii")
+    return f"data:{content_type};base64,{encoded}"
+
+
+def _download_image_candidate(image_url: str, base_headers: dict) -> str:
+    current_url = image_url
+    cookie_jar = None
+    for _ in range(4):
+        parsed = urlparse(current_url)
+        if parsed.scheme != 'https' or not parsed.hostname:
+            raise ValueError("unsupported image redirect URL")
+        is_chaoxing = _is_chaoxing_host(parsed.hostname)
+        if is_chaoxing and cookie_jar is None:
+            from api.cookies import use_cookies
+            cookie_jar = _chaoxing_cookie_jar(use_cookies())
+        headers = dict(base_headers)
+        if is_chaoxing:
+            headers["Referer"] = "https://mooc1.chaoxing.com/"
+        with _get_image_response(
+            current_url,
+            headers=headers,
+            cookies=cookie_jar if is_chaoxing else None,
+            timeout=15,
+            allow_redirects=False,
+            stream=True,
+        ) as response:
+            if 300 <= response.status_code < 400:
+                location = response.headers.get("Location")
+                if not location:
+                    raise ValueError("image redirect has no location")
+                current_url = urljoin(current_url, location)
+                continue
+            return _image_response_data_url(response, current_url)
+    raise ValueError("too many image redirects")
+
+
+def _image_data_url(image_url: str) -> Optional[str]:
+    """Download a question image without leaking session cookies off-origin."""
+    image_url = html.unescape(image_url.strip())
+    if not image_url:
+        return None
+    inline_url = _inline_image_data_url(image_url)
+    if inline_url or image_url.lower().startswith("data:"):
+        return inline_url
+
+    parsed = urlparse(image_url)
+    if not parsed.scheme:
+        image_url = urljoin('https://mooc1.chaoxing.com/', image_url)
+        parsed = urlparse(image_url)
+    if parsed.scheme == 'http':
+        parsed = parsed._replace(scheme='https')
+        image_url = urlunparse(parsed)
+    if parsed.scheme != 'https' or not parsed.hostname:
+        logger.warning("题目图片地址不可用，将跳过该图片")
+        return None
+
+    base_headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        "Accept-Encoding": "identity",
+    }
+    try:
+        return _download_image_candidate(image_url, base_headers)
+    except (requests.RequestException, ValueError) as exc:
+        logger.warning("题目图片不可用，将留空并保存: {}", type(exc).__name__)
+        return None
+
+
+def _multimodal_content(value: str) -> tuple[object, bool, bool]:
+    """Convert HTML with images to content parts and report image availability."""
+    value = str(value or "")
+    matches = list(_IMAGE_TAG_RE.finditer(value))
+    if not matches:
+        return html.unescape(_HTML_TAG_RE.sub("", value)), False, True
+
+    logger.debug("检测到 {} 个图片资源，使用多模态请求", len(matches))
+    parts = []
+    images_available = True
+    cursor = 0
+    for match in matches:
+        text_part = html.unescape(_HTML_TAG_RE.sub("", value[cursor:match.start()]))
+        if text_part:
+            parts.append({"type": "text", "text": text_part})
+        image_url = _image_data_url(match.group(2))
+        if image_url:
+            parts.append({"type": "image_url", "image_url": {"url": image_url}})
+        else:
+            images_available = False
+        cursor = match.end()
+
+    tail = html.unescape(_HTML_TAG_RE.sub("", value[cursor:]))
+    if tail:
+        parts.append({"type": "text", "text": tail})
+    return parts, True, images_available
 
 __all__ = ["CacheDAO", "Tiku", "TikuFallback", "TikuYanxi", "TikuGo", "TikuLike", "TikuAdapter", "AI", "SiliconFlow",
            "TikuManual"]
@@ -173,7 +431,7 @@ class Tiku(ABC):
         skip_cache = bool(getattr(self, 'work_feedback', None))
 
         if not skip_cache:
-            cached = cache_dao.get_cache(q_info['title'])
+            cached = cache_dao.get_cache(_question_cache_key(q_info))
             if cached:
                 logger.info(f"从缓存中获取答案：{q_info['title']} -> {cached}")
                 return cached.strip()
@@ -191,7 +449,7 @@ class Tiku(ABC):
 
         # 重做模式不写缓存，避免把未经人工确认的答案固化下来。
         if not skip_cache:
-            cache_dao.add_cache(q_info['title'], answer)
+            cache_dao.add_cache(_question_cache_key(q_info), answer)
         return answer
 
     def query_all(self, q_list: list[dict], query_delay: float = 0.0) -> list[Optional[str]]:
@@ -211,7 +469,7 @@ class Tiku(ABC):
                 pending_indices.append(idx)
                 continue
 
-            answer = cache_dao.get_cache(q['title'])
+            answer = cache_dao.get_cache(_question_cache_key(q))
             if answer:
                 logger.info(f"从缓存中获取答案：{q['title']} -> {answer}")
                 results[idx] = answer.strip()
@@ -242,7 +500,7 @@ class Tiku(ABC):
                 logger.info(f"从{self.name}获取答案：{q_info['title']} -> {ans}")
                 if check_answer(ans, q_info['type'], self):
                     if not skip_cache:
-                        to_cache[q_info['title']] = ans
+                        to_cache[_question_cache_key(q_info)] = ans
                     results[idx] = ans
                 else:
                     logger.info(f"从{self.name}获取到的答案类型与题目类型不符，已舍弃")
@@ -1124,6 +1382,34 @@ class TikuAdapter(Tiku):
         self.api = self._conf['url']
 
 
+def _is_loopback_endpoint(endpoint: str) -> bool:
+    """Return whether an API endpoint points at the local machine."""
+    host = (urlparse(endpoint or '').hostname or '').rstrip('.').lower()
+    if host == 'localhost':
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _openai_client(endpoint: str, api_key: str, http_proxy: str = '') -> OpenAI:
+    """Build an OpenAI client without leaking local traffic into the system proxy.
+
+    httpx picks up the system proxy (the Windows registry on this platform) even
+    for loopback addresses, so requests to a local model server get forwarded to
+    the proxy and fail with 502. Local endpoints and explicitly configured
+    proxies must use a client that ignores the environment.
+    """
+    if http_proxy:
+        return OpenAI(http_client=httpx.Client(proxy=http_proxy, trust_env=False),
+                      base_url=endpoint, api_key=api_key)
+    if _is_loopback_endpoint(endpoint):
+        return OpenAI(http_client=httpx.Client(trust_env=False),
+                      base_url=endpoint, api_key=api_key)
+    return OpenAI(base_url=endpoint, api_key=api_key)
+
+
 class AI(Tiku):
     # AI大模型答题实现
     def __init__(self, config_path: Optional[str] = None) -> None:
@@ -1185,15 +1471,7 @@ class AI(Tiku):
         key = (self.endpoint, self.key, self.http_proxy)
         if self._client is not None and self._client_key == key:
             return self._client
-        if self.http_proxy:
-            httpx_client = httpx.Client(proxy=self.http_proxy)
-            self._client = OpenAI(
-                http_client=httpx_client,
-                base_url=self.endpoint,
-                api_key=self.key,
-            )
-        else:
-            self._client = OpenAI(base_url=self.endpoint, api_key=self.key)
+        self._client = _openai_client(self.endpoint, self.key, self.http_proxy)
         self._client_key = key
         return self._client
 
@@ -1211,14 +1489,34 @@ class AI(Tiku):
         client = self._get_client()
         # 去除选项字母，防止大模型直接输出字母而非内容
         options_list = options_text(q_info.get("options")).split("\n")
-        cleaned_options = [re.sub(r"^[A-Z]\s*", "", option) for option in options_list]
+        image_choice = _image_choice(q_info)
+        cleaned_options = options_list if image_choice else [
+            re.sub(r"^[A-Z]\s*", "", option) for option in options_list
+        ]
         options = "\n".join(cleaned_options)
+        question_content, has_images, images_available = _multimodal_content(
+            f"题目：{q_info.get('title', '')}\n选项：{options}"
+        )
+        if has_images and not images_available:
+            logger.warning("题目图片不可用，跳过 AI 作答并留空")
+            return None
 
         # 上一轮章节检测的错误反馈（若有）
         feedback_text = self._build_work_feedback_text()
 
-        def _make_messages(system_content: str, user_content: str) -> list:
+        def _make_messages(system_content: str, user_content: object) -> list:
             """构造带反馈上下文的消息列表."""
+            if has_images:
+                system_content += (
+                    "\n题干或选项包含图片。请识别图片中的文字、公式和图形信息后再作答，"
+                    "如果无法可靠识别，请返回 {\"Answer\": []}，不要猜测。"
+                )
+            if image_choice:
+                system_content = (
+                    '根据题干和各选项字母后紧随的图片作答。单选只选择一个字母，多选选择所有正确字母。'
+                    '只输出 JSON，例如 {"Answer":["B"]} 或 {"Answer":["A","C"]}。'
+                    '不要返回公式或选项正文。如果图片不清楚或无法判断，返回 {"Answer":[]}。'
+                )
             messages = [
                 {
                     "role": "system",
@@ -1248,7 +1546,7 @@ class AI(Tiku):
                 model=self.model,
                 messages=_make_messages(
                     "本题为单选题，你只能选择一个选项，请根据题目和选项回答问题，以json格式输出正确的选项内容，示例回答：{\"Answer\": [\"答案\"]}。除此之外不要输出任何多余的内容，也不要使用MD语法。如果你使用了互联网搜索，也请不要返回搜索的结果和参考资料",
-                    f"题目：{q_info['title']}\n选项：{options}"
+                    question_content
                 )
             ))
         elif q_info['type'] == 'multiple':
@@ -1256,7 +1554,7 @@ class AI(Tiku):
                 model=self.model,
                 messages=_make_messages(
                     "本题为多选题，你必须选择两个或以上选项，请根据题目和选项回答问题，以json格式输出正确的选项内容，示例回答：{\"Answer\": [\"答案1\",\n\"答案2\",\n\"答案3\"]}。除此之外不要输出任何多余的内容，也不要使用MD语法。如果你使用了互联网搜索，也请不要返回搜索的结果和参考资料",
-                    f"题目：{q_info['title']}\n选项：{options}"
+                    question_content
                 )
             ))
         elif q_info['type'] == 'completion':
@@ -1264,7 +1562,7 @@ class AI(Tiku):
                 model=self.model,
                 messages=_make_messages(
                     "本题为填空题，你必须根据语境和相关知识填入合适的内容，请根据题目回答问题，以json格式输出正确的答案，示例回答：{\"Answer\": [\"答案\"]}。除此之外不要输出任何多余的内容，也不要使用MD语法。如果你使用了互联网搜索，也请不要返回搜索的结果和参考资料",
-                    f"题目：{q_info['title']}"
+                    question_content
                 )
             ))
         elif q_info['type'] == 'judgement':
@@ -1272,7 +1570,7 @@ class AI(Tiku):
                 model=self.model,
                 messages=_make_messages(
                     "本题为判断题，你只能回答正确或者错误，请根据题目回答问题，以json格式输出正确的答案，示例回答：{\"Answer\": [\"正确\"]}。除此之外不要输出任何多余的内容，也不要使用MD语法。如果你使用了互联网搜索，也请不要返回搜索的结果和参考资料",
-                    f"题目：{q_info['title']}"
+                    question_content
                 )
             ))
         else:
@@ -1286,9 +1584,15 @@ class AI(Tiku):
 
         try:
             response = json.loads(remove_md_json_wrapper(completion.choices[0].message.content))
+            if image_choice:
+                values = response.get('Answer')
+                if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
+                    return None
+                selected = _choice_letters('\n'.join(values), q_info)
+                return '\n'.join(selected) if selected else None
             sep = "\n"
             return sep.join(response['Answer']).strip()
-        except (ValueError, KeyError, TypeError, IndexError) as exc:
+        except (ValueError, KeyError, TypeError, IndexError, AttributeError) as exc:
             logger.error("无法解析大模型输出内容: {}", exc)
             return None
 
@@ -1373,6 +1677,13 @@ class SiliconFlow(Tiku):
             "Content-Type": "application/json"
         }
 
+        question_content, has_images, images_available = _multimodal_content(
+            f"题目：{q_info.get('title', '')}\n选项：{options_text(q_info.get('options'))}"
+        )
+        if has_images and not images_available:
+            logger.warning("题目图片不可用，跳过 AI 作答并留空")
+            return None
+
         # 构造系统提示词
         system_prompt = ""
         if q_info['type'] == "single":
@@ -1386,6 +1697,18 @@ class SiliconFlow(Tiku):
         else:
             system_prompt = "本题为简答题，请根据题目给出简洁准确的答案，以JSON格式输出：示例回答：{\"Answer\": [\"答案文本\"]}。除此之外不要输出任何多余的内容，也不要使用MD语法。如果你使用了互联网搜索，也请不要返回搜索的结果和参考资料"
 
+        if has_images:
+            system_prompt += (
+                "\n题干或选项包含图片。请识别图片中的文字、公式和图形信息后再作答，"
+                "如果无法可靠识别，请返回 {\"Answer\": []}，不要猜测。"
+            )
+        if _image_choice(q_info):
+            system_prompt = (
+                '根据题干和各选项字母后紧随的图片作答。单选只选择一个字母，多选选择所有正确字母。'
+                '只输出 JSON，例如 {"Answer":["B"]} 或 {"Answer":["A","C"]}。'
+                '不要返回公式或选项正文。如果无法判断，返回 {"Answer":[]}。'
+            )
+
         # 构造请求体
         payload = {
             "model": self.model_name,
@@ -1396,7 +1719,7 @@ class SiliconFlow(Tiku):
                 },
                 {
                     "role": "user",
-                    "content": f"题目：{q_info['title']}\n选项：{options_text(q_info.get('options'))}"
+                    "content": question_content
                 }
             ],
             "stream": False,
@@ -1423,6 +1746,12 @@ class SiliconFlow(Tiku):
                 result = response.json()
                 content = result['choices'][0]['message']['content']
                 parsed = json.loads(remove_md_json_wrapper(content))
+                if _image_choice(q_info):
+                    values = parsed.get('Answer')
+                    if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
+                        return None
+                    selected = _choice_letters('\n'.join(values), q_info)
+                    return '\n'.join(selected) if selected else None
                 return "\n".join(parsed['Answer']).strip()
             else:
                 logger.error(f"API请求失败：{response.status_code} {response.text}")
