@@ -30,6 +30,136 @@ from fxxxxc.orchestrator import ChapterTask, JobProcessor, process_job  # noqa: 
 
 _BOOL_TRUE = {"1", "true", "yes", "y", "on"}
 
+# 配置 schema：section.key -> 校验/归一化规则。GUI 与引擎共用这一份定义，
+# 非法入参在写入前被拒绝（fail-closed），合法值归一化后落盘。
+_NOTOPEN_ACTIONS = {"retry", "ask", "continue"}
+_MANUAL_MODES = {"batch", "single"}
+_SEPARATORS = {";", ",", " ", "tab", "\\n", "；", "，"}
+_BOOL_KEYS = {
+    ("common", "use_cookies"),
+    ("common", "work_redo_enabled"),
+    ("common", "add_learning_count"),
+    ("tiku", "check_llm_connection"),
+    ("tiku", "submit"),
+    ("tiku", "likeapi_search"),
+    ("tiku", "likeapi_vision"),
+    ("tiku", "likeapi_retry"),
+    ("tiku", "insecure_skip_verify"),
+}
+_FLOAT_RANGE = {
+    ("common", "speed"): (1.0, 2.0),
+    ("common", "retry_interval"): (0.0, 60.0),
+    ("common", "learning_count_interval"): (0.0, 3600.0),
+    ("tiku", "cover_rate"): (0.0, 1.0),
+    ("tiku", "delay"): (0.0, 60.0),
+    ("tiku", "go_min_interval"): (0.0, 60.0),
+    ("tiku", "go_retry_backoff"): (1.0, 10.0),
+}
+_INT_RANGE = {
+    ("common", "jobs"): (1, 16),
+    ("common", "chapter_max_tries"): (1, 20),
+    ("common", "work_max_retries"): (0, 10),
+    ("common", "target_count"): (1, 10000),
+    ("tiku", "min_interval_seconds"): (0, 600),
+    ("tiku", "likeapi_retry_times"): (1, 10),
+    ("tiku", "go_retry_times"): (1, 10),
+}
+_ENUMS = {
+    ("common", "notopen_action"): _NOTOPEN_ACTIONS,
+    ("tiku", "manual_mode_default"): _MANUAL_MODES,
+}
+_PROVIDER_NAMES = None  # lazily imported from api.answer
+
+
+def _provider_registry_names() -> set[str]:
+    global _PROVIDER_NAMES
+    if _PROVIDER_NAMES is None:
+        try:
+            from api.answer import PROVIDER_REGISTRY
+            _PROVIDER_NAMES = set(PROVIDER_REGISTRY)
+        except Exception:  # noqa: BLE001 - validation must not crash the server
+            _PROVIDER_NAMES = set()
+    return _PROVIDER_NAMES
+
+
+def _normalize_bool(value: str) -> str:
+    return "true" if _as_bool(value, False) else "false"
+
+
+def _parseable_float(value: str) -> bool:
+    try:
+        float(value)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _parseable_int(value: str) -> bool:
+    try:
+        int(value)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def validate_config_value(section: str, key: str, raw: str) -> tuple[str, str | None]:
+    """Return ``(normalized, error)`` for one config value."""
+    pair = (section, key)
+    value = str(raw)
+    if pair in _BOOL_KEYS:
+        return _normalize_bool(value), None
+    if pair in _FLOAT_RANGE:
+        low, high = _FLOAT_RANGE[pair]
+        if value.strip() == "" or not _parseable_float(value):
+            return str(low), f"{section}.{key} 需为数字（{low}~{high}）"
+        number = min(high, max(low, float(value)))
+        return f"{number:g}", None
+    if pair in _INT_RANGE:
+        low, high = _INT_RANGE[pair]
+        if value.strip() == "" or not _parseable_int(value):
+            return str(low), f"{section}.{key} 需为整数（{low}~{high}）"
+        return str(min(high, max(low, int(value)))), None
+    if pair in _ENUMS:
+        text = value.strip().lower()
+        allowed = _ENUMS[pair]
+        if text not in allowed:
+            return next(iter(sorted(allowed))), f"{section}.{key} 仅允许 {'/'.join(sorted(allowed))}"
+        return text, None
+    if pair == ("tiku", "provider"):
+        names = [part.strip() for part in value.split(",") if part.strip()]
+        if not names:
+            return "", None  # 未配置题库是合法状态
+        registry = _provider_registry_names()
+        invalid = [name for name in names if name not in registry]
+        if invalid:
+            return value, f"tiku.provider 未知题库: {', '.join(invalid)}"
+        return ", ".join(names), None
+    if pair == ("tiku", "manual_mode_separator"):
+        if value in _SEPARATORS:
+            return value, None
+        return ";", "tiku.manual_mode_separator 仅允许 ; , space tab \\n"
+    return value.strip(), None
+
+
+def normalize_config_patch(patch: dict[str, dict[str, Any]]) -> tuple[dict[str, dict[str, str]], list[str]]:
+    """Validate a patch; return ``(normalized_patch, errors)`` (fail-closed)."""
+    normalized: dict[str, dict[str, str]] = {}
+    errors: list[str] = []
+    for section, items in patch.items():
+        if not isinstance(section, str) or not isinstance(items, dict):
+            errors.append("config 节必须是 {section: {key: value}}")
+            continue
+        for key, value in items.items():
+            if not isinstance(key, str) or isinstance(value, (dict, list)):
+                errors.append(f"{section}.{key} 的值类型不合法")
+                continue
+            normalized_value, error = validate_config_value(section, key, str(value))
+            if error:
+                errors.append(error)
+                continue
+            normalized.setdefault(section, {})[key] = normalized_value
+    return normalized, errors
+
 
 def _as_bool(value, default: bool = False) -> bool:
     if value is None:
@@ -142,6 +272,7 @@ class EngineService:
             "app.info": lambda p: self.app_info(),
             "config.get": self.config_get,
             "config.set": self.config_set,
+            "config.validate": self.config_validate,
             "auth.login": self.auth_login,
             "auth.status": lambda p: self.auth_status(),
             "auth.logout": lambda p: self.auth_logout(),
@@ -190,19 +321,23 @@ class EngineService:
         patch = params.get("config") or params.get("patch")
         if not isinstance(patch, dict):
             raise RpcError(-32602, "config.set requires {config: {section: {key: value}}}")
-        for section, items in patch.items():
-            if not isinstance(section, str) or not isinstance(items, dict):
-                raise RpcError(-32602, "config sections must be objects")
-            for key, value in items.items():
-                if not isinstance(key, str) or isinstance(value, (dict, list)):
-                    raise RpcError(-32602, f"invalid config value for {section}.{key}")
+        normalized, errors = normalize_config_patch(patch)
+        if errors:
+            raise RpcError(-32602, "；".join(errors), {"errors": errors})
         with self._lock:
             data = self._read_config()
-            for section, items in patch.items():
+            for section, items in normalized.items():
                 data.setdefault(section, {}).update(items)
             self._write_config(data)
         self.bus.emit("config.changed", {})
-        return {"ok": True, "config_path": str(self.config_path)}
+        return {"ok": True, "config_path": str(self.config_path), "normalized": normalized}
+
+    def config_validate(self, params: dict) -> dict:
+        patch = params.get("config") or {}
+        if not isinstance(patch, dict):
+            raise RpcError(-32602, "config.validate requires {config: {...}}")
+        normalized, errors = normalize_config_patch(patch)
+        return {"ok": not errors, "errors": errors, "normalized": normalized}
 
     def _common_config(self) -> dict[str, Any]:
         raw = self._read_config().get("common", {})

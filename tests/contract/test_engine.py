@@ -187,3 +187,36 @@ def test_websocket_receives_bus_events(server, service):
         assert payload["params"]["type"] in {"config.changed", "log"}
     finally:
         sock.close()
+
+
+def test_config_set_normalizes_valid_values(service):
+    result = service.dispatch("config.set", {"config": {"common": {"jobs": "99", "speed": "3"}}})
+    assert result["ok"] is True
+    assert result["normalized"]["common"]["jobs"] == "16"  # clamped to schema max
+    assert result["normalized"]["common"]["speed"] == "2"
+    stored = service.dispatch("config.get", {})["config"]["common"]
+    assert stored["jobs"] == "16"
+    assert stored["speed"] == "2"
+
+
+def test_config_set_rejects_invalid_values_fail_closed(service):
+    with pytest.raises(RpcError) as excinfo:
+        service.dispatch("config.set", {"config": {"common": {"speed": "abc"}}})
+    assert excinfo.value.code == -32602
+    assert "speed" in excinfo.value.message
+    # fail-closed: nothing was written
+    stored = service.dispatch("config.get", {})["config"].get("common", {})
+    assert "speed" not in stored
+
+
+def test_config_set_rejects_unknown_tiku_provider(service):
+    with pytest.raises(RpcError) as excinfo:
+        service.dispatch("config.set", {"config": {"tiku": {"provider": "NoSuchProvider"}}})
+    assert "NoSuchProvider" in excinfo.value.message
+
+
+def test_config_validate_does_not_write(service):
+    result = service.dispatch("config.validate", {"config": {"common": {"notopen_action": "bogus"}}})
+    assert result["ok"] is False
+    assert result["errors"]
+    assert "notopen_action" not in service.dispatch("config.get", {})["config"].get("common", {})
