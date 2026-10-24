@@ -49,6 +49,7 @@ jobs:
         run: |
           pyinstaller --noconfirm --clean --noconsole --onedir `
             --name fxxxxc-engine `
+            --icon gui/windows/runner/resources/app_icon.ico `
             --add-data "resource;resource" `
             --collect-submodules fxxxxc `
             --hidden-import api.captcha `
