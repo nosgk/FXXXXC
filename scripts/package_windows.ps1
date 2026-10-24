@@ -18,6 +18,8 @@ New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
 $guiRelease = Join-Path $rootPath "gui/build/windows/x64/runner/Release"
 if (Test-Path $guiRelease) {
     Copy-Item -Recurse -Force (Join-Path $guiRelease "*") $packageDir
+    $guiExe = Join-Path $packageDir "fxxxxc.exe"
+    if (Test-Path $guiExe) { Rename-Item -Force $guiExe "FXXXXC.exe" }
     Write-Host "Copied Flutter GUI from $guiRelease"
 } else {
     Write-Host "Flutter GUI release not found; packaging engine only."

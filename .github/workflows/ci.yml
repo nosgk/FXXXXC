@@ -124,10 +124,6 @@ jobs:
         working-directory: gui
         run: flutter pub get
 
-      - name: Generate code
-        working-directory: gui
-        run: dart run build_runner build --delete-conflicting-outputs
-
       - name: Analyze
         working-directory: gui
         run: flutter analyze
@@ -185,7 +181,6 @@ jobs:
         working-directory: gui
         run: |
           flutter pub get
-          dart run build_runner build --delete-conflicting-outputs
           flutter build windows --release
 
       - name: Package
