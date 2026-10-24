@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chaoxing"
-version = "3.2.1"
+version = "3.2.2"
 description = "超星学习通/超星尔雅/泛雅超星全自动无人值守完成任务点"
 readme = "README.md"
 license = { file = "LICENSE" }
