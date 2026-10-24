@@ -150,6 +150,8 @@ gui/windows/flutter/ephemeral/
 gui/*.iml
 # the generic `lib/` rule above would ignore Flutter sources
 !gui/lib/
+# the generic `*.manifest` rule above would ignore the Flutter runner manifest
+!gui/windows/runner/runner.exe.manifest
 
 # Custom files
 .cookies.txt
