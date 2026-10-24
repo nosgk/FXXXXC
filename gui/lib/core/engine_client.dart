@@ -64,7 +64,9 @@ class EngineClient {
         process = await Process.start(
           bundled.path,
           ['--port', '0', '--data-dir', _dataDir!.path],
-          environment: {'FXXXXC_ENGINE_TOKEN': _token},
+          // Keep the parent environment (SystemRoot etc.) or TLS/network init
+          // inside the engine breaks on Windows.
+          environment: {...Platform.environment, 'FXXXXC_ENGINE_TOKEN': _token},
           workingDirectory: _dataDir!.path,
         );
       } else {
@@ -73,7 +75,7 @@ class EngineClient {
         process = await Process.start(
           'python',
           ['-m', 'fxxxxc.engine', '--port', '0', '--data-dir', _dataDir!.path],
-          environment: {'FXXXXC_ENGINE_TOKEN': _token},
+          environment: {...Platform.environment, 'FXXXXC_ENGINE_TOKEN': _token},
           workingDirectory: repoRoot,
           runInShell: true,
         );

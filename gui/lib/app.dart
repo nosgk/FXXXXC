@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:window_manager/window_manager.dart';
 
 import 'core/engine_client.dart';
 import 'core/models.dart';
@@ -52,6 +53,29 @@ class AppShell extends ConsumerStatefulWidget {
 
 class _AppShellState extends ConsumerState<AppShell> {
   int _index = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    // First frame paints immediately; only after that do we touch native
+    // window APIs and spawn the Python engine. Blocking either before the
+    // first frame is what made packaged builds hang as "not responding".
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _initWindow();
+      ref.read(connectionProvider.notifier).ensureStarted();
+    });
+  }
+
+  Future<void> _initWindow() async {
+    try {
+      await windowManager.ensureInitialized();
+      await windowManager.setTitle('FXXXXC');
+      await windowManager.setMinimumSize(const Size(1000, 700));
+    } catch (error) {
+      // Window decoration is cosmetic; never let it break startup.
+      debugPrint('window init skipped: $error');
+    }
+  }
 
   @override
   Widget build(BuildContext context) {

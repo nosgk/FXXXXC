@@ -13,6 +13,7 @@ enum ConnState { connecting, ready, error }
 class ConnectionNotifier extends Notifier<ConnState> {
   StreamSubscription? _sub;
   Timer? _poll;
+  bool _starting = false;
 
   @override
   ConnState build() {
@@ -20,8 +21,19 @@ class ConnectionNotifier extends Notifier<ConnState> {
       _sub?.cancel();
       _poll?.cancel();
     });
-    start();
+    // Startup is triggered from AppShell's post-frame callback so the first
+    // frame paints immediately; never block it on process/native work.
     return ConnState.connecting;
+  }
+
+  Future<void> ensureStarted() async {
+    if (_starting || state == ConnState.ready) return;
+    _starting = true;
+    try {
+      await start();
+    } finally {
+      _starting = false;
+    }
   }
 
   Future<void> start() async {
