@@ -22,10 +22,14 @@ class ConnectionNotifier extends Notifier<ConnState> {
 
   @override
   ConnState build() {
+    final client = ref.read(engineClientProvider);
     ref.onDispose(() {
       _sub?.cancel();
       _poll?.cancel();
       _logFlush?.cancel();
+      // Belt for container teardown; the window-close handler is the primary
+      // kill path (dispose may not run before process teardown).
+      unawaited(client.stop());
     });
     // Startup is triggered from AppShell's post-frame callback so the first
     // frame paints immediately; never block it on process/native work.

@@ -63,7 +63,9 @@ class EngineClient {
       if (bundled.existsSync()) {
         process = await Process.start(
           bundled.path,
-          ['--port', '0', '--data-dir', _dataDir!.path],
+          ['--port', '0', '--data-dir', _dataDir!.path,
+           // 引擎看门狗：GUI 进程消失（含被任务管理器杀死）时自动退出
+           '--parent-pid', pid.toString()],
           // Keep the parent environment (SystemRoot etc.) or TLS/network init
           // inside the engine breaks on Windows.
           environment: {...Platform.environment, 'FXXXXC_ENGINE_TOKEN': _token},
@@ -74,7 +76,8 @@ class EngineClient {
         final repoRoot = Directory.current.parent.path;
         process = await Process.start(
           'python',
-          ['-m', 'fxxxxc.engine', '--port', '0', '--data-dir', _dataDir!.path],
+          ['-m', 'fxxxxc.engine', '--port', '0', '--data-dir', _dataDir!.path,
+           '--parent-pid', pid.toString()],
           environment: {...Platform.environment, 'FXXXXC_ENGINE_TOKEN': _token},
           workingDirectory: repoRoot,
           runInShell: true,
@@ -197,8 +200,33 @@ class EngineClient {
     final process = _process;
     _process = null;
     if (process != null) {
-      process.kill();
-      await process.exitCode.timeout(const Duration(seconds: 3), onTimeout: () => 0);
+      if (Platform.isWindows) {
+        // TerminateProcess only kills the direct child; the engine (and the
+        // runInShell python fallback) can leave grandchildren behind, so kill
+        // the whole tree. The engine's parent watchdog is the crash net.
+        try {
+          await Process.run(
+            'taskkill',
+            ['/PID', '${process.pid}', '/T', '/F'],
+            runInShell: false,
+          );
+        } catch (_) {
+          process.kill();
+        }
+      } else {
+        process.kill();
+      }
+      try {
+        await process.exitCode.timeout(const Duration(seconds: 3));
+      } catch (_) {
+        process.kill();
+      }
     }
+    // Remove the stale handshake file so a restarted GUI can't read a dead port.
+    try {
+      final stale = File(
+          '${_dataDir!.path}${Platform.pathSeparator}engine-runtime.json');
+      if (await stale.exists()) await stale.delete();
+    } catch (_) {}
   }
 }

@@ -54,6 +54,7 @@ class AppShell extends ConsumerStatefulWidget {
 class _AppShellState extends ConsumerState<AppShell> {
   int _index = 0;
   final Set<int> _visited = {0};
+  bool _exiting = false;
 
   @override
   void initState() {
@@ -72,10 +73,29 @@ class _AppShellState extends ConsumerState<AppShell> {
       await windowManager.ensureInitialized();
       await windowManager.setTitle('FXXXXC');
       await windowManager.setMinimumSize(const Size(1000, 700));
+      // Intercept the close button: kill the engine tree before destroying
+      // the window, otherwise the Python sidecar outlives the GUI.
+      await windowManager.setPreventClose(true);
+      windowManager.addListener(_AppWindowListener(_exitApp));
     } catch (error) {
       // Window decoration is cosmetic; never let it break startup.
       debugPrint('window init skipped: $error');
     }
+  }
+
+  Future<void> _exitApp() async {
+    if (_exiting) return;
+    _exiting = true;
+    try {
+      await ref
+          .read(engineClientProvider)
+          .stop()
+          .timeout(const Duration(seconds: 6));
+    } catch (_) {
+      // Even if stop fails/times out, still exit — the engine's parent
+      // watchdog will clean up after our pid disappears.
+    }
+    await windowManager.destroy();
   }
 
   void _select(int index) {
@@ -185,6 +205,18 @@ class _AppShellState extends ConsumerState<AppShell> {
         ],
       ),
     );
+  }
+}
+
+/// Bridges window_manager's onWindowClose to the app exit cleanup.
+class _AppWindowListener extends WindowListener {
+  _AppWindowListener(this.onClose);
+
+  final Future<void> Function() onClose;
+
+  @override
+  void onWindowClose() {
+    onClose();
   }
 }
 
