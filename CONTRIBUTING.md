@@ -25,7 +25,7 @@ cd gui && flutter analyze && flutter test
 ## 构建与发布
 
 - **不在本地构建**。Windows 产物由 `.github/workflows/ci.yml` 手动触发构建（Actions → Run workflow）。
-- 工作流会在推送时自动运行——这是有意设计，构建需要人工触发。
+- CI 只做构建（引擎 + GUI + 打包），不再运行质量门禁——推送不会自动触发任何流程；质量检查靠本地 pre-commit/pytest 自查。
 
 ## 提交规范
 

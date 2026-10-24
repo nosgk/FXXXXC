@@ -101,11 +101,11 @@ docker run -it -v /本地路径/config.ini:/config/config.ini fxxxxc
 
 ## :rocket: 构建（GitHub Actions，手动触发）
 
-构建不在本地进行。仓库提供单一工作流 `.github/workflows/ci.yml`：
+构建不在本地进行。`.github/workflows/ci.yml` 是单一 Windows 构建 job：
 
 - 触发方式：仅 `workflow_dispatch`（Actions 页面手动 Run），推送不会自动触发；
-- 流程：Python 质量（ruff/mypy/bandit/pip-audit/pytest+coverage）→ Windows 测试 → Flutter 质量（analyze/test）→ Windows x64 构建（PyInstaller 引擎 + Flutter GUI）→ 便携 zip + SHA256；
-- 产物命名 `FXXXXC-windows-x64-<version>.zip`，可在 Run 页面下载，也可勾选创建 Release。
+- 流程：PyInstaller 引擎 + Flutter Windows release → 便携 zip + SHA256 → 上传 artifact（可勾选创建 Release）；
+- 质量检查不再占用 CI：提交前请在本地跑 `pre-commit run --all-files` 与 `pytest -q`（见 CONTRIBUTING）。
 
 ## :heart: 参与贡献
 
