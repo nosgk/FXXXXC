@@ -109,7 +109,7 @@ jobs:
 
   flutter-quality:
     name: Flutter quality
-    if: ${{ inputs.build_gui && hashFiles('gui/pubspec.yaml') != '' }}
+    if: ${{ inputs.build_gui }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
