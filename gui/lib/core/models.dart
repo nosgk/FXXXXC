@@ -8,6 +8,8 @@ class Course {
     required this.title,
     this.teacher = '',
     this.cpi = '',
+    this.cover = '',
+    this.notOpen = false,
   });
 
   final String courseId;
@@ -15,6 +17,13 @@ class Course {
   final String title;
   final String teacher;
   final String cpi;
+  /// 课程封面地址（引擎 best-effort 提取，可能为空 → GUI 回退占位图）。
+  final String cover;
+  /// 平台侧未开放（不可进入学习）的课程。
+  final bool notOpen;
+
+  /// 课程详情/章节状态的缓存键。
+  String get detailKey => '$courseId|$clazzId|$cpi';
 
   factory Course.fromJson(Map<String, dynamic> json) => Course(
         courseId: '${json['courseId'] ?? ''}',
@@ -22,6 +31,111 @@ class Course {
         title: '${json['title'] ?? ''}',
         teacher: '${json['teacher'] ?? ''}',
         cpi: '${json['cpi'] ?? ''}',
+        cover: '${json['cover'] ?? ''}',
+        notOpen: json['notOpen'] == true || json['notOpen'] == 'true',
+      );
+
+  Map<String, dynamic> toJson() => {
+        'courseId': courseId,
+        'clazzId': clazzId,
+        'title': title,
+        'teacher': teacher,
+        'cpi': cpi,
+        'cover': cover,
+        'notOpen': notOpen,
+      };
+}
+
+/// 单个章节的状态（course.detail 返回）。
+class ChapterStatus {
+  const ChapterStatus({
+    required this.index,
+    required this.title,
+    required this.finished,
+    required this.jobCount,
+    required this.needUnlock,
+  });
+
+  final int index;
+  final String title;
+  final bool finished;
+  final int jobCount;
+  final bool needUnlock;
+
+  factory ChapterStatus.fromJson(Map<String, dynamic> json) => ChapterStatus(
+        index: (json['index'] as num?)?.toInt() ?? 0,
+        title: '${json['title'] ?? ''}',
+        finished: json['finished'] == true,
+        jobCount: (json['job_count'] as num?)?.toInt() ?? 0,
+        needUnlock: json['need_unlock'] == true,
+      );
+}
+
+/// 一门课程的章节状态明细。
+class CourseDetail {
+  const CourseDetail({
+    required this.courseId,
+    required this.clazzId,
+    required this.chapters,
+    required this.total,
+    required this.finished,
+    required this.locked,
+    required this.hasLocked,
+  });
+
+  final String courseId;
+  final String clazzId;
+  final List<ChapterStatus> chapters;
+  final int total;
+  final int finished;
+  final int locked;
+  final bool hasLocked;
+
+  double? get progress => total <= 0 ? null : (finished / total).clamp(0.0, 1.0);
+
+  factory CourseDetail.fromJson(Map<String, dynamic> json) {
+    final rawChapters = (json['chapters'] as List?) ?? const [];
+    return CourseDetail(
+      courseId: '${json['course_id'] ?? ''}',
+      clazzId: '${json['clazz_id'] ?? ''}',
+      chapters: rawChapters
+          .whereType<Map>()
+          .map((item) => ChapterStatus.fromJson(item.cast<String, dynamic>()))
+          .toList(),
+      total: (json['total'] as num?)?.toInt() ?? 0,
+      finished: (json['finished'] as num?)?.toInt() ?? 0,
+      locked: (json['locked'] as num?)?.toInt() ?? 0,
+      hasLocked: json['has_locked'] == true,
+    );
+  }
+}
+
+/// 本轮运行中单门课程的实时进度（study.status courses_progress）。
+class CourseProgress {
+  const CourseProgress({
+    required this.courseId,
+    required this.title,
+    required this.total,
+    required this.done,
+    required this.failed,
+  });
+
+  final String courseId;
+  final String title;
+  final int total;
+  final int done;
+  final int failed;
+
+  bool get isRunning => done < total;
+
+  double get progress => total <= 0 ? 0 : (done / total).clamp(0.0, 1.0);
+
+  factory CourseProgress.fromJson(Map<String, dynamic> json) => CourseProgress(
+        courseId: '${json['course_id'] ?? ''}',
+        title: '${json['title'] ?? ''}',
+        total: (json['total'] as num?)?.toInt() ?? 0,
+        done: (json['done'] as num?)?.toInt() ?? 0,
+        failed: (json['failed'] as num?)?.toInt() ?? 0,
       );
 }
 
@@ -143,6 +257,8 @@ class StudyStatus {
     this.lastCourseIds = const [],
     this.tikuQueries = 0,
     this.tikuHits = 0,
+    this.bankStats = const [],
+    this.coursesProgress = const [],
     this.coverRate,
     this.lastScore,
   });
@@ -159,8 +275,17 @@ class StudyStatus {
   final List<String> lastCourseIds;
   final int tikuQueries;
   final int tikuHits;
+  /// 每个题库源的命中统计（多题库梯度回退时逐源展示）。
+  final List<BankStat> bankStats;
+  /// 本轮运行每门课程的实时进度。
+  final List<CourseProgress> coursesProgress;
   final double? coverRate;
   final double? lastScore;
+
+  /// 按课程ID索引的本轮进度，课程页徽标/进度条直接取用。
+  Map<String, CourseProgress> get progressByCourse => {
+        for (final item in coursesProgress) item.courseId: item,
+      };
 
   double get progress => total <= 0 ? 0 : (done / total).clamp(0.0, 1.0);
 
@@ -180,6 +305,8 @@ class StudyStatus {
     List<String>? lastCourseIds,
     int? tikuQueries,
     int? tikuHits,
+    List<BankStat>? bankStats,
+    List<CourseProgress>? coursesProgress,
     double? coverRate,
     double? lastScore,
   }) =>
@@ -195,6 +322,8 @@ class StudyStatus {
         lastCourseIds: lastCourseIds ?? this.lastCourseIds,
         tikuQueries: tikuQueries ?? this.tikuQueries,
         tikuHits: tikuHits ?? this.tikuHits,
+        bankStats: bankStats ?? this.bankStats,
+        coursesProgress: coursesProgress ?? this.coursesProgress,
         coverRate: coverRate ?? this.coverRate,
         lastScore: lastScore ?? this.lastScore,
       );
@@ -204,13 +333,20 @@ class StudyStatus {
     final tikuStats = json['tiku_stats'];
     var queries = 0;
     var hits = 0;
+    final banks = <BankStat>[];
     if (tikuStats is Map) {
-      for (final value in tikuStats.values) {
-        if (value is Map) {
-          queries += (value['queries'] as num?)?.toInt() ?? 0;
-          hits += (value['hits'] as num?)?.toInt() ?? 0;
-        }
-      }
+      tikuStats.forEach((key, value) {
+        if (value is! Map) return;
+        final bankQueries = (value['queries'] as num?)?.toInt() ?? 0;
+        final bankHits = (value['hits'] as num?)?.toInt() ?? 0;
+        queries += bankQueries;
+        hits += bankHits;
+        banks.add(BankStat(
+          name: '$key',
+          queries: bankQueries,
+          hits: bankHits,
+        ));
+      });
     }
     return StudyStatus(
       state: '${json['state'] ?? 'idle'}',
@@ -228,8 +364,24 @@ class StudyStatus {
           .toList(),
       tikuQueries: queries,
       tikuHits: hits,
+      bankStats: banks,
+      coursesProgress: ((json['courses_progress'] as List?) ?? const [])
+          .whereType<Map>()
+          .map((item) => CourseProgress.fromJson(item.cast<String, dynamic>()))
+          .toList(),
     );
   }
+}
+
+/// 单个题库源的命中统计（来自引擎 TikuFallback.get_stats）。
+class BankStat {
+  const BankStat({required this.name, required this.queries, required this.hits});
+
+  final String name;
+  final int queries;
+  final int hits;
+
+  double? get hitRate => queries <= 0 ? null : (hits / queries).clamp(0.0, 1.0);
 }
 
 class ManualQuestion {

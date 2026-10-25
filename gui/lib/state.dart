@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:collection';
+import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -93,6 +95,20 @@ class ConnectionNotifier extends Notifier<ConnState> {
               '${data['state'] ?? ''}',
               '${data['detail'] ?? ''}',
             );
+        break;
+      case 'study.progress':
+        // 加载课程阶段的细粒度上下文（engine 每门课发一条），反馈到状态详情。
+        if ('${data['phase'] ?? ''}' == 'loading_course') {
+          final title = '${data['course_title'] ?? ''}';
+          ref.read(statusProvider.notifier).patchState(
+                'loading',
+                title.isEmpty ? '正在加载课程' : '正在加载课程：$title',
+              );
+        }
+        break;
+      case 'config.changed':
+        // CLI 或其他端改了配置：让设置页回读最新值（脏字段由设置页自行保护）。
+        ref.invalidate(configProvider);
         break;
       case 'manual.question':
         ref.read(manualProvider.notifier).setBatch(data);
@@ -305,14 +321,57 @@ final manualProvider = NotifierProvider<ManualNotifier, ManualQueue>(ManualNotif
 class CoursesNotifier extends AsyncNotifier<List<Course>> {
   bool _refreshing = false;
 
+  static const _diskCacheKey = 'courses_cache_v2';
+
   @override
   Future<List<Course>> build() async {
-    final client = ref.watch(engineClientProvider);
     final connection = ref.watch(connectionProvider);
     if (connection != ConnState.ready) return const [];
+    // 冷启动先回放磁盘缓存立即出内容（stale-while-revalidate），后台再刷新。
+    final cached = await _readDiskCache();
+    if (cached.isNotEmpty) {
+      unawaited(_fetchAndStore());
+      return cached;
+    }
+    return _fetchAndStore();
+  }
+
+  Future<List<Course>> _fetchAndStore() async {
+    final client = ref.read(engineClientProvider);
     final result = await client.rpc('courses.list', {'refresh': true});
     final items = (result is Map ? result['courses'] as List? : null) ?? const [];
-    return items.map((item) => Course.fromJson((item as Map).cast<String, dynamic>())).toList();
+    final courses = items
+        .map((item) => Course.fromJson((item as Map).cast<String, dynamic>()))
+        .toList();
+    unawaited(_writeDiskCache(courses));
+    return courses;
+  }
+
+  Future<List<Course>> _readDiskCache() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_diskCacheKey);
+      if (raw == null || raw.isEmpty) return const [];
+      final decoded = jsonDecode(raw) as List? ?? const [];
+      return decoded
+          .whereType<Map>()
+          .map((item) => Course.fromJson(item.cast<String, dynamic>()))
+          .toList();
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  Future<void> _writeDiskCache(List<Course> courses) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(
+        _diskCacheKey,
+        jsonEncode([for (final course in courses) course.toJson()]),
+      );
+    } catch (_) {
+      // 缓存失败不影响功能。
+    }
   }
 
   Future<void> refresh() async {
@@ -320,11 +379,7 @@ class CoursesNotifier extends AsyncNotifier<List<Course>> {
     _refreshing = true;
     // 旧数据保留显示（stale-while-revalidate），避免每次刷新闪骨架屏。
     try {
-      final result = await ref.read(engineClientProvider).rpc('courses.list', {'refresh': true});
-      final items = (result is Map ? result['courses'] as List? : null) ?? const [];
-      final courses = items
-          .map((item) => Course.fromJson((item as Map).cast<String, dynamic>()))
-          .toList();
+      final courses = await _fetchAndStore();
       state = AsyncData(courses);
       // 状态同步：课程列表变化后修剪已失效的选课 ID。
       if (courses.isNotEmpty) {
@@ -345,6 +400,181 @@ class CoursesNotifier extends AsyncNotifier<List<Course>> {
 
 final coursesProvider =
     AsyncNotifierProvider<CoursesNotifier, List<Course>>(CoursesNotifier.new);
+
+/// 并发闸门：章节详情预取最多同时 3 个请求，防止滚动时打出请求风暴。
+class FetchGate {
+  FetchGate(this.maxConcurrent);
+
+  final int maxConcurrent;
+  int _running = 0;
+  final Queue<Completer<void>> _waiters = Queue<Completer<void>>();
+
+  Future<void> acquire() {
+    if (_running < maxConcurrent) {
+      _running++;
+      return Future.value();
+    }
+    final completer = Completer<void>();
+    _waiters.add(completer);
+    return completer.future;
+  }
+
+  void release() {
+    if (_waiters.isNotEmpty) {
+      _waiters.removeFirst().complete();
+      return;
+    }
+    _running = (_running - 1).clamp(0, maxConcurrent);
+  }
+}
+
+final _courseDetailGate = FetchGate(3);
+
+/// 课程章节状态详情（键：`courseId|clazzId|cpi`）。
+/// keepAlive 缓存 + 卡片构建时预取；详情弹窗里可 invalidate 强刷。
+final courseDetailProvider =
+    FutureProvider.family<CourseDetail, String>((ref, key) async {
+  final parts = key.split('|');
+  await _courseDetailGate.acquire();
+  try {
+    final result = await ref.read(engineClientProvider).rpc('course.detail', {
+      'course_id': parts.isNotEmpty ? parts[0] : '',
+      'clazz_id': parts.length > 1 ? parts[1] : '',
+      'cpi': parts.length > 2 ? parts[2] : '',
+    });
+    return CourseDetail.fromJson((result as Map).cast<String, dynamic>());
+  } finally {
+    _courseDetailGate.release();
+  }
+});
+
+/// 课程页筛选/排序状态（查询词、状态、排序），持久化到本地。
+class CourseFilterState {
+  const CourseFilterState({
+    this.query = '',
+    this.status = 'all',
+    this.sort = 'default',
+  });
+
+  final String query;
+  final String status; // all | running | notOpen | selected
+  final String sort; // default | name
+
+  bool get isDefault =>
+      query.isEmpty && status == 'all' && sort == 'default';
+
+  CourseFilterState copyWith({
+    String? query,
+    String? status,
+    String? sort,
+  }) =>
+      CourseFilterState(
+        query: query ?? this.query,
+        status: status ?? this.status,
+        sort: sort ?? this.sort,
+      );
+}
+
+class CoursesFilterNotifier extends Notifier<CourseFilterState> {
+  static const _persistKey = 'courses_filter_v1';
+  Timer? _persistTimer;
+
+  @override
+  CourseFilterState build() {
+    // 恢复持久化的筛选状态（异步回填，不阻塞首帧）。
+    unawaited(_restore());
+    ref.onDispose(() => _persistTimer?.cancel());
+    return const CourseFilterState();
+  }
+
+  Future<void> _restore() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_persistKey);
+      if (raw == null) return;
+      final decoded = jsonDecode(raw) as Map? ?? const {};
+      state = CourseFilterState(
+        query: '${decoded['query'] ?? ''}',
+        status: '${decoded['status'] ?? 'all'}',
+        sort: '${decoded['sort'] ?? 'default'}',
+      );
+    } catch (_) {
+      // 恢复失败保持默认。
+    }
+  }
+
+  void _update(CourseFilterState next) {
+    state = next;
+    // 持久化做 300ms 防抖，快速敲字不写盘。
+    _persistTimer?.cancel();
+    _persistTimer = Timer(const Duration(milliseconds: 300), () {
+      unawaited(_persist());
+    });
+  }
+
+  Future<void> _persist() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_persistKey, jsonEncode({
+        'query': state.query,
+        'status': state.status,
+        'sort': state.sort,
+      }));
+    } catch (_) {}
+  }
+
+  // ignore: use_setters_to_change_properties
+  void setQuery(String query) => _update(state.copyWith(query: query));
+
+  void setStatus(String status) => _update(state.copyWith(status: status));
+
+  void setSort(String sort) => _update(state.copyWith(sort: sort));
+
+  void reset() => _update(const CourseFilterState());
+}
+
+final coursesFilterProvider =
+    NotifierProvider<CoursesFilterNotifier, CourseFilterState>(
+        CoursesFilterNotifier.new);
+
+/// 把筛选/排序应用到课程列表（纯函数，供页面与测试共用）。
+List<Course> applyCourseFilter(
+  List<Course> courses,
+  CourseFilterState filter,
+  Set<String> selectedIds, {
+  Map<String, CourseProgress> liveProgress = const {},
+}) {
+  var result = courses;
+  final query = filter.query.trim().toLowerCase();
+  if (query.isNotEmpty) {
+    bool matches(Course course) =>
+        course.title.toLowerCase().contains(query) ||
+        course.teacher.toLowerCase().contains(query) ||
+        course.courseId.contains(query);
+    result = result.where(matches).toList();
+  }
+  switch (filter.status) {
+    case 'running':
+      result = result
+          .where((course) =>
+              liveProgress[course.courseId]?.isRunning ?? false)
+          .toList();
+      break;
+    case 'notOpen':
+      result = result.where((course) => course.notOpen).toList();
+      break;
+    case 'selected':
+      result = result
+          .where((course) => selectedIds.contains(course.courseId))
+          .toList();
+      break;
+  }
+  if (filter.sort == 'name') {
+    final sorted = [...result]..sort((a, b) => a.title.compareTo(b.title));
+    result = sorted;
+  }
+  return result;
+}
 
 class SelectedCoursesNotifier extends Notifier<Set<String>> {
   @override

@@ -70,6 +70,11 @@ class _DashboardPageState extends ConsumerState<DashboardPage> {
     final selectedCount = ref.watch(selectedCoursesProvider.select((set) => set.length));
 
     final skeleton = status.state == 'loading' && status.total == 0 && activity.isEmpty;
+    // 最近出错的普通任务（排除整轮 run 级错误），告警条里给出具体条目。
+    final recentErrors = [
+      for (final item in activity)
+        if (item.isError && item.kind != 'run') item,
+    ].take(3).toList();
 
     return Column(
       children: [
@@ -88,10 +93,14 @@ class _DashboardPageState extends ConsumerState<DashboardPage> {
               ),
               if (!skeleton && (status.failed > 0 || status.state == 'error')) ...[
                 const SizedBox(height: 12),
-                _AlertStrip(status: status),
+                _AlertStrip(status: status, errors: recentErrors),
               ],
               const SizedBox(height: 12),
               _MetricsGrid(status: status, skeleton: skeleton),
+              if (status.bankStats.isNotEmpty) ...[
+                const SizedBox(height: 8),
+                _BankStatsRow(stats: status.bankStats),
+              ],
             ],
           ),
         ),
@@ -395,9 +404,10 @@ class _ElapsedTextState extends State<_ElapsedText> {
 // ---------------------------------------------------------------- 异常告警条
 
 class _AlertStrip extends StatelessWidget {
-  const _AlertStrip({required this.status});
+  const _AlertStrip({required this.status, required this.errors});
 
   final StudyStatus status;
+  final List<TaskActivity> errors;
 
   @override
   Widget build(BuildContext context) {
@@ -411,20 +421,110 @@ class _AlertStrip extends StatelessWidget {
         color: scheme.errorContainer.withValues(alpha: 0.5),
         borderRadius: BorderRadius.circular(16),
       ),
-      child: Row(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Icon(Icons.warning_amber_rounded, color: scheme.error, size: 20),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Text(
-              message,
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(color: scheme.onErrorContainer),
-            ),
+          Row(
+            children: [
+              Icon(Icons.warning_amber_rounded, color: scheme.error, size: 20),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  message,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(color: scheme.onErrorContainer),
+                ),
+              ),
+            ],
           ),
+          if (errors.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 6,
+              runSpacing: 6,
+              children: [
+                for (final item in errors)
+                  Tooltip(
+                    message: item.describe(),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                      decoration: BoxDecoration(
+                        color: scheme.errorContainer,
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(kindIcon(item.kind), size: 12, color: scheme.onErrorContainer),
+                          const SizedBox(width: 4),
+                          ConstrainedBox(
+                            constraints: const BoxConstraints(maxWidth: 220),
+                            child: Text(
+                              item.name.isNotEmpty ? item.name : item.describe(),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: Theme.of(context)
+                                  .textTheme
+                                  .labelSmall
+                                  ?.copyWith(color: scheme.onErrorContainer),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ],
         ],
       ),
+    );
+  }
+}
+
+/// 题库分源命中统计条：多题库梯度回退时逐源展示 查询/命中。
+class _BankStatsRow extends StatelessWidget {
+  const _BankStatsRow({required this.stats});
+
+  final List<BankStat> stats;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      children: [
+        for (final bank in stats)
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+            decoration: BoxDecoration(
+              color: theme.colorScheme.surfaceContainerHigh,
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.quiz_outlined, size: 13, color: theme.colorScheme.outline),
+                const SizedBox(width: 6),
+                Text(bank.name, style: theme.textTheme.labelSmall),
+                const SizedBox(width: 8),
+                Text(
+                  '${bank.hits}/${bank.queries}',
+                  style: theme.textTheme.labelSmall?.copyWith(
+                    fontWeight: FontWeight.w700,
+                    color: bank.queries == 0
+                        ? theme.colorScheme.outline
+                        : (bank.hitRate ?? 0) >= 0.6
+                            ? kSuccessColor
+                            : kWarningColor,
+                  ),
+                ),
+              ],
+            ),
+          ),
+      ],
     );
   }
 }
