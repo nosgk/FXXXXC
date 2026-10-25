@@ -62,13 +62,20 @@ def process_job(
     job: dict,
     job_info: dict,
     speed: float,
+    chapter: str = "",
 ) -> StudyResult:
     """Dispatch one task point to the appropriate study implementation."""
     job_type = job.get("type")
     task_name = str(job.get("name") or job.get("jobid") or job_type or "unknown")
     _emit(
         chaoxing,
-        {"kind": str(job_type or "unknown"), "phase": "start", "name": task_name, "course": course.get("title", "")},
+        {
+            "kind": str(job_type or "unknown"),
+            "phase": "start",
+            "name": task_name,
+            "course": course.get("title", ""),
+            "chapter": chapter,
+        },
     )
 
     if job_type == "video":
@@ -81,25 +88,25 @@ def process_job(
             logger.warning(
                 f"出现异常任务 -> 任务章节: {course.get('title', '')} 任务ID: {job.get('jobid', '')}, 已跳过"
             )
-        _emit_job_result(chaoxing, job_type, task_name, course, video_result)
+        _emit_job_result(chaoxing, job_type, task_name, course, video_result, chapter=chapter)
         return video_result
 
     if job_type == "document":
         logger.trace(f"识别到文档任务, 任务章节: {course.get('title', '')} 任务ID: {job.get('jobid', '')}")
         result = chaoxing.study_document(course, job)
-        _emit_job_result(chaoxing, job_type, task_name, course, result)
+        _emit_job_result(chaoxing, job_type, task_name, course, result, chapter=chapter)
         return result
 
     if job_type == "workid":
         logger.trace(f"识别到章节检测任务, 任务章节: {course.get('title', '')}")
         result = chaoxing.study_work(course, job, job_info)
-        _emit_job_result(chaoxing, job_type, task_name, course, result)
+        _emit_job_result(chaoxing, job_type, task_name, course, result, chapter=chapter)
         return result
 
     if job_type == "read":
         logger.trace(f"识别到阅读任务, 任务章节: {course.get('title', '')}")
         result = chaoxing.study_read(course, job, job_info)
-        _emit_job_result(chaoxing, job_type, task_name, course, result)
+        _emit_job_result(chaoxing, job_type, task_name, course, result, chapter=chapter)
         return result
 
     if job_type == "live":
@@ -124,7 +131,7 @@ def process_job(
             thread.start()
             thread.join()
             live_result = StudyResult.SUCCESS if result_holder.get("ok") else StudyResult.ERROR
-            _emit_job_result(chaoxing, job_type, task_name, course, live_result)
+            _emit_job_result(chaoxing, job_type, task_name, course, live_result, chapter=chapter)
             return live_result
         except Exception as exc:  # noqa: BLE001 - a live task must not kill the worker
             logger.error(f"处理直播任务时出错: {exc}")
@@ -136,7 +143,7 @@ def process_job(
     return StudyResult.ERROR
 
 
-def _emit_job_result(chaoxing, job_type, task_name, course, result) -> None:
+def _emit_job_result(chaoxing, job_type, task_name, course, result, chapter: str = "") -> None:
     _emit(
         chaoxing,
         {
@@ -144,6 +151,7 @@ def _emit_job_result(chaoxing, job_type, task_name, course, result) -> None:
             "phase": "error" if result.is_failure() else "done",
             "name": task_name,
             "course": course.get("title", ""),
+            "chapter": chapter,
             "result": result.name.lower(),
         },
     )
@@ -459,7 +467,7 @@ def process_chapter(
                 },
             )
             return ChapterResult.ERROR
-        job_results.append(process_job(chaoxing, course, job, job_info, speed))
+        job_results.append(process_job(chaoxing, course, job, job_info, speed, chapter=str(point.get("title", ""))))
 
     failed = any(result.is_failure() for result in job_results)
     _emit(
@@ -476,11 +484,41 @@ def process_chapter(
     return ChapterResult.ERROR if failed else ChapterResult.SUCCESS
 
 
+def _dedupe_courses(courses):
+    """同一 (courseId, clazzId) 只保留一条."""
+    course_task = []
+    seen_keys = set()
+    for course in courses:
+        key = (course["courseId"], course["clazzId"])
+        if key not in seen_keys:
+            course_task.append(course)
+            seen_keys.add(key)
+    return course_task
+
+
+def _format_course_list(all_course, limit: int = 20) -> str:
+    """生成可读的课程列表，用于提示或报错."""
+    shown = all_course if limit is None else all_course[:limit]
+    lines = [
+        f"  ID: {course['courseId']} 班级ID: {course['clazzId']} 课程名: {course['title']}"
+        for course in shown
+    ]
+    if limit is not None and len(all_course) > limit:
+        lines.append(f"  ...（其余 {len(all_course) - limit} 门课程略）")
+    return "\n".join(lines)
+
+
 def filter_courses(all_course, course_list):
-    """Filter courses; an explicit list with no match is an error."""
+    """Filter courses.
+
+    安全规则（对齐上游 PR #642）：刷课是对账号的真实写操作，选课范围被
+    静默放大比直接失败更危险 —— 因此显式给出的 ID 列表只要有任何一个未
+    命中就报错，绝不回退成“学习全部课程”；学习全部课程必须显式填 all。
+    """
     if isinstance(course_list, str):
         course_list = [item.strip() for item in course_list.split(",") if item.strip()]
-    explicit_list = bool(course_list)
+    else:
+        course_list = [str(item).strip() for item in (course_list or []) if str(item).strip()]
 
     if not course_list:
         print("*" * 10 + "课程列表" + "*" * 10)
@@ -489,34 +527,38 @@ def filter_courses(all_course, course_list):
         print("*" * 28)
         print("提示: 同一 courseId 下若存在多个班级, 将分别完成。")
         try:
-            raw = input("请输入想要学习的课程列表,以逗号分隔,例: 2151141,189191,198198\n")
+            raw = input("请输入想要学习的课程列表,以逗号分隔,例: 2151141,189191,198198（填 all 表示全部）\n")
         except Exception as exc:
             raise InputFormatError("输入格式错误") from exc
         course_list = [item.strip() for item in raw.split(",") if item.strip()]
-        explicit_list = bool(course_list)
-
-    course_task = []
-    seen_keys = set()
-    for course in all_course:
-        key = (course["courseId"], course["clazzId"])
-        if course["courseId"] in course_list and key not in seen_keys:
-            course_task.append(course)
-            seen_keys.add(key)
-
-    if not course_task:
-        if explicit_list:
-            available = ", ".join(
-                f"{course['courseId']}({course['title']})" for course in all_course[:20]
-            )
+        if not course_list:
             raise InputFormatError(
-                "指定的课程ID未匹配到任何课程，请检查 course_list。"
-                f"可用课程: {available or '无'}"
+                "未指定要学习的课程。请填写课程ID，或输入 all 学习全部课程。"
             )
-        course_task = all_course
 
-    matched_ids = {course["courseId"] for course in course_task}
-    unknown_ids = [course_id for course_id in course_list if course_id not in matched_ids]
-    if unknown_ids:
-        logger.warning("以下课程ID未匹配到课程，已忽略: {}", ", ".join(unknown_ids))
+    # 学习全部课程需要显式声明 all / *，避免配置写错时扩大刷课范围；
+    # all 必须单独填写，否则同列表里填错的 ID 会被全部课程静默吞掉。
+    if any(item in ("all", "*") for item in course_list):
+        if len(course_list) > 1:
+            raise InputFormatError(
+                f"all / * 表示全部课程，不能和课程ID混写: {', '.join(course_list)}"
+            )
+        logger.info("已显式指定学习全部课程")
+        return _dedupe_courses(all_course)
+
+    wanted = set(course_list)
+    course_task = _dedupe_courses(
+        [course for course in all_course if course["courseId"] in wanted]
+    )
+
+    # 只要有一个未命中就报错并列出可用课程，防止“少刷了几门课”被静默吞掉
+    matched = {course["courseId"] for course in course_task}
+    unmatched = [item for item in course_list if item not in matched]
+    if unmatched:
+        raise InputFormatError(
+            f"课程ID {', '.join(unmatched)} 不在当前账号的课程列表中"
+            "（course_list 只接受 courseId，课程名无效），本次未启动任何刷课任务。"
+            "可用课程如下:\n" + _format_course_list(all_course)
+        )
 
     return course_task

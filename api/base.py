@@ -268,6 +268,11 @@ class Chaoxing:
     def get_course_list(self):
         _session = SessionManager.get_session()
         _url = "https://mooc2-ans.chaoxing.com/mooc2-ans/visit/courselistdata"
+        # 入参与官方 interaction 页面保持一致且全部可控：
+        #   courseType=1      只拉“我学的课”
+        #   courseFolderId=0  顶层列表（文件夹内的课程由下方逐文件夹补齐）
+        #   query             官方搜索框的关键字（本程序在 GUI 侧过滤，固定为空）
+        #   superstarClass=0  不含超星示范班课程
         _data = {"courseType": 1, "courseFolderId": 0, "query": "", "superstarClass": 0}
         logger.trace("正在读取所有的课程列表...")
 
@@ -651,6 +656,20 @@ class Chaoxing:
                 logger.trace(f"关闭进度条失败: {e}")
         return None
 
+    @staticmethod
+    def _get_video_resume_time_seconds(play_time_ms, duration_seconds: int) -> int:
+        """把毫秒播放位置换算为续播秒数（官方播放器规则）。
+
+        官方 modules/video/index.js 中 playTime >= 视频总时长时会把续播位置
+        重置为 0 重新播放；这里对齐该行为，防止把“已到片尾”当作可续播进度。
+        非法输入一律按 0 处理。
+        """
+        try:
+            play_time_seconds = int(play_time_ms) // 1000
+        except (TypeError, ValueError):
+            return 0
+        return play_time_seconds if 0 <= play_time_seconds < duration_seconds else 0
+
     def study_video(self, _course, _job, _job_info, _speed: float = 1.0,
                     _type: Literal["Video", "Audio"] = "Video") -> StudyResult:
         _session = SessionManager.get_session()
@@ -681,15 +700,22 @@ class Chaoxing:
         # Time in the real world: last_iter, gc.THRESHOLD
         # Time in the video (can be scaled with the speed factor): duration, play_time, last_log_time, wait_time
 
-        try:
-            play_time = int(_job.get("playTime", 0)) // 1000
-        except (TypeError, ValueError):
-            play_time = 0
-        last_log_time = 0
+        raw_play_ms = _job.get("playTime", 0)
+        play_time = self._get_video_resume_time_seconds(raw_play_ms, duration)
+        # None 表示尚未做过首次上报：进循环立刻上报续播位置，而不是把总时长
+        # 写进进度（旧实现先发 duration,duration 的 isdrag=4 上报“瞬间完成”，
+        # 平台会把该位置重置为 0，导致 isPassed 永远不落库、任务永远未完成）。
+        last_log_time = None
         last_iter = time.time()
         wait_time = int(random.uniform(30, 90))
 
-        logger.info(f"开始任务: {_job.get('name', '')}, 总时长: {duration}s, 已进行: {play_time}s")
+        logger.info(f"开始任务: {_job.get('name', '')}, 总时长: {duration}s, 续播位置: {play_time}s")
+        try:
+            raw_play_seconds = int(raw_play_ms) // 1000
+        except (TypeError, ValueError):
+            raw_play_seconds = 0
+        if raw_play_seconds >= duration > 0:
+            logger.info("{} 的原始播放位置已到末尾，按官方播放器规则从 0s 续播", _job.get("name", ""))
 
         forbidden_retry = 0
         max_forbidden_retry = 2
@@ -723,13 +749,7 @@ class Chaoxing:
         _last_emit_ts[0] = time.monotonic()
         _emit_video_progress()
 
-        passed, state = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, duration, duration,
-                                                _type, headers=headers, _isdrag=4)
-        if passed:
-            logger.info("任务瞬间完成: {}", _job.get("name", ""))
-            self.emit_progress({"kind": _type.lower(), "phase": "done", "name": _job.get("name", ""), "progress": 1.0})
-            return StudyResult.SUCCESS
-
+        passed = False
         pbar = None
         try:
             while not passed:
@@ -737,7 +757,8 @@ class Chaoxing:
                     logger.info("收到取消请求, 停止视频任务: {}", _job.get("name", ""))
                     return StudyResult.ERROR
                 # Sometimes the last request needs to be sent several times to complete the task
-                if play_time >= duration or play_time - last_log_time >= wait_time:
+                # 首次上报续播位置，与后续上报共用错误处理，避免把总时长写入进度
+                if last_log_time is None or play_time >= duration or play_time - last_log_time >= wait_time:
                     if play_time >= duration:
                         final_attempts += 1
 
@@ -761,9 +782,11 @@ class Chaoxing:
                             duration = int(refreshed_meta["duration"])
                             refreshed_play_time = refreshed_meta.get("playTime")
                             if refreshed_play_time is not None:
-                                play_time = int(refreshed_play_time)
+                                play_time = self._get_video_resume_time_seconds(refreshed_play_time, duration)
+                            # 恢复后立即上报重置后的续播位置，避免用恢复前的旧进度继续
+                            last_log_time = None
 
-                            logger.debug("刷新后的令牌: {}, 持续时间: {}, 播放时间: {}", _dtoken, duration, play_time)
+                            logger.debug("刷新视频状态后，总时长: {}s，续播位置: {}s", duration, play_time)
                             pbar = self._close_pbar_safe(pbar)
                             final_attempts = 0
                             continue

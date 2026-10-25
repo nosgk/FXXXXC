@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import itertools
 import threading
 import time
 from typing import Any
@@ -95,17 +96,47 @@ def _video_chaoxing(monkeypatch: pytest.MonkeyPatch, passed: bool) -> tuple[Chao
 
 class TestVideoFinalConfirmBounded:
     def test_stuck_at_full_progress_exits_with_error(self, monkeypatch):
-        """进度已到片尾但平台不确认时，有界重试后必须返回 ERROR 而非死循环。"""
+        """进度到片尾但平台不确认时，有界重试后必须返回 ERROR 而非死循环。
+
+        对齐官方播放器规则（上游 PR #646）：已到片尾的 playTime 会被重置为 0
+        续播，因此用片尾前 1s 的续播位置 + 加速时钟推进到片尾来构造“卡 100%”。
+        """
         chaoxing, events = _video_chaoxing(monkeypatch, passed=False)
         job = {"name": "v", "jobid": "j1", "objectid": "o1", "otherinfo": "x-rt_d", "rt": "1",
-               "playTime": 100000, "videoFaceCaptureEnc": "", "attDuration": "", "attDurationEnc": ""}
+               "playTime": 99000, "videoFaceCaptureEnc": "", "attDuration": "", "attDurationEnc": ""}
         course = {"courseId": 1, "clazzId": 2, "cpi": 3, "title": "课程"}
+        monkeypatch.setattr(base_mod.gc, "THRESHOLD", 0)  # 不真实等待
+        clock = iter(itertools.count(0, 30))  # 每次读时钟推进 30s 视频时间
+        monkeypatch.setattr(base_mod.time, "time", lambda: next(clock))
         started = time.monotonic()
         result = chaoxing.study_video(course, job, {}, _speed=1.0, _type="Video")
         assert result is StudyResult.ERROR
         assert time.monotonic() - started < 5  # 不允许真实长时间循环
         kinds = {(e["kind"], e["phase"]) for e in events}
         assert ("video", "progress") in kinds
+
+    def test_resume_at_end_resets_to_zero_never_reports_duration(self, monkeypatch):
+        """已到片尾的 playTime 必须重置为 0 续播，且禁止把总时长写进进度上报。"""
+        chaoxing, _events = _video_chaoxing(monkeypatch, passed=False)
+        reported: list[tuple[int, int]] = []
+
+        def _log(_session, _course, _job, _job_info, _dtoken, duration, position,
+                 *_args, **_kwargs):
+            reported.append((duration, position))
+            return (False, 200)
+
+        monkeypatch.setattr(chaoxing, "video_progress_log", _log)
+        monkeypatch.setattr(base_mod.gc, "THRESHOLD", 0)
+        clock = iter(itertools.count(0, 200))  # 一步推进到片尾
+        monkeypatch.setattr(base_mod.time, "time", lambda: next(clock))
+        job = {"name": "v", "jobid": "j1", "objectid": "o1", "otherinfo": "x", "rt": "1",
+               "playTime": 100000, "videoFaceCaptureEnc": "", "attDuration": "", "attDurationEnc": ""}
+        course = {"courseId": 1, "clazzId": 2, "cpi": 3, "title": "课程"}
+        result = chaoxing.study_video(course, job, {}, _speed=1.0, _type="Video")
+        assert result is StudyResult.ERROR  # 有界终态确认失败后放行
+        # 首次上报必须是官方规则重置后的 0s（旧实现会先发 duration,duration
+        # 的 isdrag=4 “瞬间完成”上报，把总时长写进进度且跳过真实播放）。
+        assert reported[0] == (100, 0)
 
     def test_passing_video_emits_done(self, monkeypatch):
         chaoxing, events = _video_chaoxing(monkeypatch, passed=True)

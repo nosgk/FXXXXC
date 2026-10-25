@@ -20,9 +20,7 @@ from re import sub
 from typing import Optional
 from urllib.parse import urljoin, urlparse, urlunparse
 
-import httpx
 import requests
-from openai import OpenAI
 from urllib3 import disable_warnings, exceptions
 
 from api.answer_check import check_answer
@@ -779,6 +777,10 @@ class TikuFallback(Tiku):
 
 class TikuYanxi(Tiku):
     # 言溪题库实现
+    # 瞬时故障（网络异常/非200/非JSON）的重试：服务端偶发抖动不应直接掉到随机兜底
+    RETRY_TIMES = 3
+    RETRY_BACKOFF = 1.5  # 退避基数（秒），按尝试次数线性放大
+
     def __init__(self, config_path: Optional[str] = None) -> None:
         """初始化言溪题库实例."""
         super().__init__(config_path)
@@ -787,8 +789,23 @@ class TikuYanxi(Tiku):
         self._token = None
         self._token_index = 0  # token队列计数器
         self._times = 100  # 查询次数剩余, 初始化为100, 查询后校对修正
+        self._last_failure_transient = False  # 上次失败是否为可重试的瞬时故障
 
     def _query(self, q_info: dict):
+        for attempt in range(1, self.RETRY_TIMES + 1):
+            result = self._query_once(q_info)
+            if result is not None:
+                return result
+            if not self._last_failure_transient or attempt >= self.RETRY_TIMES:
+                return None
+            sleep_seconds = self.RETRY_BACKOFF * attempt
+            logger.warning(f'{self.name}瞬时查询失败，{sleep_seconds:.1f}s 后重试 ({attempt}/{self.RETRY_TIMES})')
+            time.sleep(sleep_seconds)
+        return None
+
+    def _query_once(self, q_info: dict):
+        """单次查询；网络异常/非200/非JSON 视为瞬时故障，可重试。"""
+        self._last_failure_transient = False
         try:
             res = requests.get(
                 self.api,
@@ -803,16 +820,19 @@ class TikuYanxi(Tiku):
             )
         except requests.RequestException as exc:
             logger.error(f'{self.name}查询异常: {exc}')
+            self._last_failure_transient = True
             return None
 
         if res.status_code != 200:
             logger.error(f'{self.name}查询失败:\n{res.text[:200]}')
+            self._last_failure_transient = True
             return None
 
         try:
             res_json = res.json()
         except ValueError:
             logger.error(f'{self.name}返回非 JSON 内容: {res.text[:200]}')
+            self._last_failure_transient = True
             return None
 
         data = res_json.get('data') or {}
@@ -823,7 +843,7 @@ class TikuYanxi(Tiku):
                 self._token_index += 1
                 self.load_token()
                 # 重新查询
-                return self._query(q_info)
+                return self._query_once(q_info)
             logger.error(
                 f'{self.name}查询失败:\n\t剩余查询数{data.get("times", f"{self._times}(仅参考)")}:\n\t消息:{res_json.get("message", "")}'
             )
@@ -1415,25 +1435,48 @@ def _is_loopback_endpoint(endpoint: str) -> bool:
         return False
 
 
-def _openai_client(endpoint: str, api_key: str, http_proxy: str = '') -> OpenAI:
+def _openai_client(endpoint: str, api_key: str, http_proxy: str = ''):
     """Build an OpenAI client without leaking local traffic into the system proxy.
 
     httpx picks up the system proxy (the Windows registry on this platform) even
     for loopback addresses, so requests to a local model server get forwarded to
     the proxy and fail with 502. Local endpoints and explicitly configured
     proxies must use a client that ignores the environment.
+
+    openai/httpx 是较重的依赖且只有配置了 AI 题库才会用到，这里延迟导入以
+    缩短引擎冷启动时间。
     """
+    from httpx import Client as HttpClient
+    from openai import OpenAI
+
     if http_proxy:
-        return OpenAI(http_client=httpx.Client(proxy=http_proxy, trust_env=False),
+        return OpenAI(http_client=HttpClient(proxy=http_proxy, trust_env=False),
                       base_url=endpoint, api_key=api_key)
     if _is_loopback_endpoint(endpoint):
-        return OpenAI(http_client=httpx.Client(trust_env=False),
+        return OpenAI(http_client=HttpClient(trust_env=False),
                       base_url=endpoint, api_key=api_key)
     return OpenAI(base_url=endpoint, api_key=api_key)
 
 
+def message_answer_text(message) -> str:
+    """
+    取出模型的回答正文.
+
+    推理型模型（如 DeepSeek 思考模式）可能 message.content 为空、答案只出现在
+    reasoning_content 里，这里做统一兜底；正文非空时优先正文。
+    """
+    content = getattr(message, 'content', None) or ''
+    if content.strip():
+        return content
+    return getattr(message, 'reasoning_content', None) or ''
+
+
 class AI(Tiku):
     # AI大模型答题实现
+    # 多数大模型默认开启深度思考，会拖慢答题并把思考内容混进输出导致解析失败，
+    # 默认通过 extra_body 关闭；所用 API 不支持该参数时可在配置中设为 {}。
+    DEFAULT_EXTRA_BODY = '{"thinking": {"type": "disabled"}}'
+
     def __init__(self, config_path: Optional[str] = None) -> None:
         """初始化AI大模型答题实现."""
         super().__init__(config_path)
@@ -1443,6 +1486,8 @@ class AI(Tiku):
         self.work_feedback = None  # 章节检测错误反馈（重做时参考）
         self._client = None
         self._client_key = None
+        self.extra_body: dict = {}
+        self.json_mode = False
 
     def set_work_feedback(self, feedback) -> None:
         """
@@ -1468,16 +1513,12 @@ class AI(Tiku):
             lines.append(str(item))
         return "\n".join(lines)
 
-    def _is_deepseek_v4(self) -> bool:
-        return (
-                'api.deepseek.com' in (self.endpoint or '').lower()
-                and (self.model or '').lower().startswith('deepseek-v4')
-        )
-
     def _completion_kwargs(self, **kwargs):
-        if self._is_deepseek_v4():
-            # DeepSeek V4 defaults to thinking mode, which can leave message.content empty.
-            kwargs['extra_body'] = {'thinking': {'type': 'disabled'}}
+        if self.json_mode:
+            # 由服务端在采样时强制输出合法 JSON，消除模型输出围栏/废话导致的解析失败
+            kwargs.setdefault('response_format', {'type': 'json_object'})
+        if self.extra_body:
+            kwargs['extra_body'] = {**kwargs.get('extra_body', {}), **self.extra_body}
         return kwargs
 
     def _wait_for_interval(self):
@@ -1604,8 +1645,10 @@ class AI(Tiku):
                 )
             ))
 
+        answer_text = ''
         try:
-            response = json.loads(remove_md_json_wrapper(completion.choices[0].message.content))
+            answer_text = message_answer_text(completion.choices[0].message)
+            response = json.loads(remove_md_json_wrapper(answer_text))
             if image_choice:
                 values = response.get('Answer')
                 if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
@@ -1615,7 +1658,12 @@ class AI(Tiku):
             sep = "\n"
             return sep.join(response['Answer']).strip()
         except (ValueError, KeyError, TypeError, IndexError, AttributeError) as exc:
-            logger.error("无法解析大模型输出内容: {}", exc)
+            # 只记异常类型与文本长度，不记原文：模型输出可能带有题干与个人信息，
+            # 长度足以区分「空响应」和「没按 JSON 格式输出」。
+            logger.error(
+                "无法解析大模型输出内容: {}: {}; 待解析文本长度 {} 字符",
+                type(exc).__name__, exc, len(answer_text),
+            )
             return None
 
     def _init_tiku(self):
@@ -1624,6 +1672,28 @@ class AI(Tiku):
         self.model = self._conf['model']
         self.http_proxy = self._conf['http_proxy']
         self.min_interval_seconds = int(self._conf['min_interval_seconds'])
+        self._load_ai_request_options()
+
+    def _load_ai_request_options(self) -> None:
+        """解析 extra_body / json_mode 配置，非法值回退默认并不阻断启动。"""
+        extra_body_raw = (self._conf.get('extra_body') or '').strip() or self.DEFAULT_EXTRA_BODY
+        try:
+            parsed = json.loads(extra_body_raw)
+            if not isinstance(parsed, dict):
+                raise ValueError('extra_body 必须是 JSON 对象')
+            self.extra_body = parsed
+        except (ValueError, TypeError) as exc:
+            logger.warning('{} 配置 extra_body 无效: {}，已忽略该项，请求不附加额外参数', self.name, exc)
+            self.extra_body = {}
+
+        json_mode_raw = str(self._conf.get('json_mode', '') or '').strip().lower()
+        if json_mode_raw in ('', 'false'):
+            self.json_mode = False
+        elif json_mode_raw == 'true':
+            self.json_mode = True
+        else:
+            logger.warning('{} 配置 json_mode 无效: {}，已按 false 处理', self.name, self._conf.get('json_mode'))
+            self.json_mode = False
 
     def check_llm_connection(self) -> bool:
         """
@@ -1645,16 +1715,16 @@ class AI(Tiku):
                     messages=[
                         {
                             'role': 'user',
-                            'content': '你好，请回答：1+1 等于几？只回答数字。'
+                            # 开启 json_mode 时，OpenAI 系端点要求消息中包含 "json" 一词
+                            'content': '你好，请以json格式回答：1+1 等于几？只回答数字。'
                         }
                     ],
                     max_tokens=200  # 增大以支持可能返回的 reasoning_content
                 ))
 
-                # 统一检查响应
+                # 统一检查响应：正文为空时兼容答案只在 reasoning_content 的推理模型
                 if completion.choices:
-                    msg = completion.choices[0].message
-                    if msg.content or getattr(msg, 'reasoning_content', None):
+                    if message_answer_text(completion.choices[0].message):
                         logger.info(f'{self.name} 连接检查成功')
                         return True
 
@@ -1766,7 +1836,9 @@ class SiliconFlow(Tiku):
 
             if response.status_code == 200:
                 result = response.json()
-                content = result['choices'][0]['message']['content']
+                message = result['choices'][0]['message']
+                # 正文为空时兼容答案只在 reasoning_content 的推理模型（DeepSeek R1 等）
+                content = message.get('content') or message.get('reasoning_content') or ''
                 parsed = json.loads(remove_md_json_wrapper(content))
                 if _image_choice(q_info):
                     values = parsed.get('Answer')
@@ -1833,12 +1905,13 @@ class SiliconFlow(Tiku):
 
                 if response.status_code == 200:
                     result = response.json()
-                    if result.get('choices') and result['choices'][0]['message']['content']:
-                        logger.info(f'{self.name} 连接检查成功')
-                        return True
-                    else:
-                        logger.error(f'{self.name} 连接检查失败：未收到有效响应')
-                        return False
+                    if result.get('choices'):
+                        message = result['choices'][0].get('message') or {}
+                        if message.get('content') or message.get('reasoning_content'):
+                            logger.info(f'{self.name} 连接检查成功')
+                            return True
+                    logger.error(f'{self.name} 连接检查失败：未收到有效响应')
+                    return False
                 else:
                     logger.error(f'{self.name} 连接检查失败：{response.status_code} {response.text}')
                     return False
@@ -2259,3 +2332,34 @@ PROVIDER_REGISTRY = {
     'SiliconFlow': SiliconFlow,
     'TikuManual': TikuManual,
 }
+
+
+def build_tiku_from_banks(banks, config_path: Optional[str] = None) -> Optional[Tiku]:
+    """按给定顺序把若干题库实例串成梯度回退链。
+
+    Args:
+        banks: ``[(实例名, 配置字典), ...]``，顺序即回退顺序；每个配置必须含
+            ``provider`` 键，其余键为该实例自己的题库配置（已由调用方合并全局项）。
+        config_path: 透传给题库实例的配置文件路径。
+
+    Returns:
+        单实例时返回该实例，多实例时返回 TikuFallback；全部无效时返回 None。
+    """
+    chain: list[Tiku] = []
+    for bank_name, conf in banks:
+        provider_name = str(conf.get('provider', '') or '').strip()
+        provider_cls = PROVIDER_REGISTRY.get(provider_name)
+        if not isinstance(provider_cls, type) or not issubclass(provider_cls, Tiku):
+            logger.error(f'题库实例 {bank_name} 的 provider 无效: {provider_name or "(空)"}，已跳过')
+            continue
+        provider = provider_cls(config_path=config_path)
+        provider.config_set(dict(conf))
+        chain.append(provider)
+
+    if not chain:
+        return None
+    if len(chain) == 1:
+        return chain[0]
+    fallback = TikuFallback(chain, config_path=config_path)
+    fallback.config_set(dict(banks[0][1]) if banks else {})
+    return fallback

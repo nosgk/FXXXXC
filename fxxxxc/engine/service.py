@@ -26,9 +26,13 @@ from fxxxxc.engine.protocol import (
 )
 from fxxxxc.config import load_ini, save_ini
 from fxxxxc.events import EventBus
-from fxxxxc.orchestrator import ChapterTask, JobProcessor, process_job  # noqa: F401 (re-export)
+from fxxxxc.orchestrator import ChapterResult, ChapterTask, JobProcessor, process_job  # noqa: F401 (re-export)
 
 _BOOL_TRUE = {"1", "true", "yes", "y", "on"}
+
+# 题库实例段前缀：每个 [tiku_bank.<id>] 是一个独立的题库源配置（含自己的
+# provider 与专属键），按 priority 升序组成梯度回退链，天然支持多题库并行启用。
+BANK_SECTION_PREFIX = "tiku_bank."
 
 # 配置 schema：section.key -> 校验/归一化规则。GUI 与引擎共用这一份定义，
 # 非法入参在写入前被拒绝（fail-closed），合法值归一化后落盘。
@@ -106,6 +110,17 @@ def validate_config_value(section: str, key: str, raw: str) -> tuple[str, str | 
     """Return ``(normalized, error)`` for one config value."""
     pair = (section, key)
     value = str(raw)
+    if section.startswith(BANK_SECTION_PREFIX):
+        # 题库实例段：enabled/priority 为实例自身键，其余键复用 tiku 段的校验规则
+        if key == "enabled":
+            return _normalize_bool(value), None
+        if key == "priority":
+            if value.strip() == "" or not _parseable_int(value):
+                return "0", "题库实例 priority 需为整数"
+            return str(int(value)), None
+        if key == "name":
+            return value.strip(), None
+        return validate_config_value("tiku", key, raw)
     if pair in _BOOL_KEYS:
         return _normalize_bool(value), None
     if pair in _FLOAT_RANGE:
@@ -200,6 +215,11 @@ class EngineManualTiku(TikuManual):
 class EngineService:
     """Owns configuration, login state and the study worker."""
 
+    # 课程章节详情缓存 TTL（秒）：章节状态在两次学习之间基本不变，
+    # GUI 展开/预取都会打到这里，短缓存避免重复请求平台。
+    COURSE_DETAIL_TTL = 120.0
+    COURSE_DETAIL_CACHE_MAX = 200
+
     def __init__(self, data_dir: str | os.PathLike[str] | None = None):
         from fxxxxc.paths import get_data_dir
 
@@ -225,6 +245,7 @@ class EngineService:
         self._manual_batches: dict[str, dict] = {}
         self._log_lines: deque[dict] = deque(maxlen=1000)
         self._log_sink_handle = None
+        self._course_details: dict[tuple[str, str], tuple[float, dict]] = {}
         self._install_log_sink()
 
     # ------------------------------------------------------------------ meta
@@ -276,10 +297,12 @@ class EngineService:
             "config.get": self.config_get,
             "config.set": self.config_set,
             "config.validate": self.config_validate,
+            "config.remove": self.config_remove,
             "auth.login": self.auth_login,
             "auth.status": lambda p: self.auth_status(),
             "auth.logout": lambda p: self.auth_logout(),
             "courses.list": self.courses_list,
+            "course.detail": self.course_detail,
             "study.start": self.study_start,
             "study.pause": lambda p: self.study_pause(),
             "study.resume": lambda p: self.study_resume(),
@@ -335,6 +358,27 @@ class EngineService:
         self.bus.emit("config.changed", {})
         return {"ok": True, "config_path": str(self.config_path), "normalized": normalized}
 
+    def config_remove(self, params: dict) -> dict:
+        """删除整个配置节（目前仅允许题库实例段，避免误删账号等关键配置）。"""
+        sections = params.get("sections") or []
+        if not isinstance(sections, list) or not all(isinstance(item, str) for item in sections):
+            raise RpcError(-32602, "config.remove requires {sections: [name]}")
+        invalid = [name for name in sections if not name.startswith(BANK_SECTION_PREFIX)]
+        if invalid:
+            raise RpcError(-32602, f"仅允许删除题库实例配置节: {', '.join(invalid)}")
+        removed = []
+        with self._lock:
+            data = self._read_config()
+            for name in sections:
+                if name in data:
+                    data.pop(name)
+                    removed.append(name)
+            if removed:
+                self._write_config(data)
+        if removed:
+            self.bus.emit("config.changed", {})
+        return {"ok": True, "removed": removed}
+
     def config_validate(self, params: dict) -> dict:
         patch = params.get("config") or {}
         if not isinstance(patch, dict):
@@ -369,11 +413,57 @@ class EngineService:
     def _tiku_config(self) -> dict[str, str]:
         return self._read_config().get("tiku", {})
 
-    # ------------------------------------------------------------------ auth
+    def _bank_instances(self, data: dict[str, dict[str, str]] | None = None) -> list[tuple[str, dict[str, str]]]:
+        """收集已启用的题库实例，按 priority 升序（同值按段名字典序）返回。
+
+        每个实例是 ``(段名, 配置)``；priority 缺省按 0 处理，段名自带稳定排序。
+        """
+        if data is None:
+            data = self._read_config()
+        banks: list[tuple[str, dict[str, str]]] = []
+        for section, items in data.items():
+            if not section.startswith(BANK_SECTION_PREFIX):
+                continue
+            conf = dict(items)
+            enabled = str(conf.get("enabled", "true")).strip().lower() in _BOOL_TRUE
+            if not enabled:
+                continue
+            try:
+                priority = int(str(conf.get("priority", "0")).strip() or "0")
+            except (TypeError, ValueError):
+                priority = 0
+            banks.append((section, conf))
+        banks.sort(key=lambda item: (
+            _as_int(item[1].get("priority"), 0),
+            item[0],
+        ))
+        return banks
 
     def _build_tiku(self) -> Tiku:
-        tiku_conf = self._tiku_config()
-        tiku = Tiku.get_tiku_from_config(dict(tiku_conf), config_path=str(self.config_path))
+        data = self._read_config()
+        tiku_conf = data.get("tiku", {})
+        has_bank_sections = any(
+            section.startswith(BANK_SECTION_PREFIX) for section in data
+        )
+        banks = self._bank_instances(data)
+        if banks:
+            # 实例链：全局键（submit/cover_rate/delay/判断词列表等）作为兜底，
+            # 实例自己的键优先 —— 每个题库源一份独立配置，互不串线。
+            merged_banks = [
+                (name, {**tiku_conf, **conf}) for name, conf in banks
+            ]
+            from api.answer import build_tiku_from_banks
+
+            tiku = build_tiku_from_banks(merged_banks, config_path=str(self.config_path))
+            if tiku is None:
+                raise RpcError(CONFIG_ERROR, "题库实例均已停用或配置无效，请先在设置中启用至少一个题库源")
+        elif has_bank_sections:
+            # 配置过实例但全部停用：明确报错而不是静默按“无题库”运行，
+            # 否则章节检测会被整体跳过且难以察觉。
+            raise RpcError(CONFIG_ERROR, "所有题库源均已停用，请至少启用一个题库源")
+        else:
+            # 兼容旧配置：单个 [tiku] provider（可逗号分隔多实现，共享一份配置）
+            tiku = Tiku.get_tiku_from_config(dict(tiku_conf), config_path=str(self.config_path))
         tiku.init_tiku()
         if isinstance(tiku, TikuManual):
             manual = EngineManualTiku(self, config_path=str(self.config_path))
@@ -381,6 +471,8 @@ class EngineService:
             manual.init_tiku()
             tiku = manual
         return tiku
+
+    # ------------------------------------------------------------------ auth
 
     def _build_chaoxing(self, common: dict[str, Any], tiku: Tiku) -> Chaoxing:
         username = common.get("username", "")
@@ -471,6 +563,56 @@ class EngineService:
             self._courses = courses
         self.bus.emit("course.list", {"count": len(courses)})
         return {"courses": courses}
+
+    def course_detail(self, params: dict) -> dict:
+        """单门课程的章节状态明细（供 GUI 课程卡展开/预取）。
+
+        带 TTL 缓存；``refresh=true`` 强制回源。返回结构化的章节列表与
+        汇总计数，GUI 不需要再解析平台 HTML。
+        """
+        course_id = str(params.get("course_id") or "").strip()
+        clazz_id = str(params.get("clazz_id") or "").strip()
+        cpi = str(params.get("cpi") or "").strip()
+        if not course_id or not clazz_id:
+            raise RpcError(-32602, "course.detail requires course_id and clazz_id")
+        refresh = _as_bool(params.get("refresh"), False)
+
+        key = (course_id, clazz_id)
+        now = time.time()
+        if not refresh:
+            with self._lock:
+                cached = self._course_details.get(key)
+                if cached is not None and now - cached[0] < self.COURSE_DETAIL_TTL:
+                    return cached[1]
+
+        chaoxing = self._ensure_chaoxing()
+        points = chaoxing.get_course_point(course_id, clazz_id, cpi)
+        chapters = []
+        for index, point in enumerate(points.get("points", [])):
+            chapters.append(
+                {
+                    "index": index,
+                    "title": str(point.get("title", "")),
+                    "finished": bool(point.get("has_finished")),
+                    "job_count": max(0, _as_int(point.get("jobCount"), 1)),
+                    "need_unlock": bool(point.get("need_unlock")),
+                }
+            )
+        payload = {
+            "course_id": course_id,
+            "clazz_id": clazz_id,
+            "chapters": chapters,
+            "total": len(chapters),
+            "finished": sum(1 for chapter in chapters if chapter["finished"]),
+            "locked": sum(1 for chapter in chapters if chapter["need_unlock"]),
+            "has_locked": bool(points.get("hasLocked")),
+        }
+        with self._lock:
+            if len(self._course_details) >= self.COURSE_DETAIL_CACHE_MAX:
+                # 简单防膨胀：超出容量时整体清空（命中一次后又会重建）。
+                self._course_details.clear()
+            self._course_details[key] = (now, payload)
+        return payload
 
     # ----------------------------------------------------------------- study
 
@@ -681,6 +823,7 @@ class EngineService:
                     "total": total,
                     "done": max(0, total - unfinished),
                     "failed": len(processor.failed_tasks),
+                    "courses_progress": self._courses_progress(processor),
                 }
             )
         elif self._chaoxing is not None:
@@ -694,6 +837,32 @@ class EngineService:
                 except Exception:  # noqa: BLE001 - stats are best effort
                     pass
         return payload
+
+    @staticmethod
+    def _courses_progress(processor: JobProcessor) -> list[dict]:
+        """把章节任务队列折算成每门课程的进度（本轮运行实时快照）。"""
+        per_course: dict[str, dict] = {}
+        order: list[str] = []
+        for task in processor.tasks:
+            key = str(task.course.get("courseId", ""))
+            if key not in per_course:
+                order.append(key)
+                per_course[key] = {
+                    "course_id": key,
+                    "title": str(task.course.get("title", "")),
+                    "total": 0,
+                    "done": 0,
+                    "failed": 0,
+                }
+            entry = per_course[key]
+            entry["total"] += 1
+            if task.result is ChapterResult.SUCCESS:
+                entry["done"] += 1
+        for task in processor.failed_tasks:
+            key = str(task.course.get("courseId", ""))
+            if key in per_course:
+                per_course[key]["failed"] += 1
+        return [per_course[key] for key in order]
 
     # ------------------------------------------------------------------ logs
 
@@ -810,13 +979,27 @@ class EngineService:
             return {"ok": False, "message": "题库未启用或配置无效"}
         get_stats = getattr(tiku, "get_stats", None)
         stats = get_stats() if callable(get_stats) else {}
-        if hasattr(tiku, "check_llm_connection"):
-            try:
-                ok = bool(tiku.check_llm_connection())
-            except Exception as exc:  # noqa: BLE001
-                return {"ok": False, "message": str(exc), "stats": stats}
-            return {"ok": ok, "message": "连接正常" if ok else "连接失败", "stats": stats}
-        return {"ok": True, "message": "题库已启用", "stats": stats}
+
+        # 分源检查：每个题库实例单独报告初始化/连接状态，方便定位是哪一个源出问题
+        providers = getattr(tiku, "providers", None) or [tiku]
+        banks = []
+        for provider in providers:
+            entry = {"name": getattr(provider, "name", None) or provider.__class__.__name__}
+            if getattr(provider, "DISABLE", False):
+                entry.update(ok=False, message="初始化失败或配置无效")
+            else:
+                try:
+                    ok = bool(provider.check_llm_connection())
+                    entry.update(ok=ok, message="连接正常" if ok else "连接失败")
+                except Exception as exc:  # noqa: BLE001 - single bank must not kill the test
+                    entry.update(ok=False, message=str(exc))
+            banks.append(entry)
+        ok = all(entry["ok"] for entry in banks) if banks else False
+        if len(banks) <= 1:
+            only = banks[0] if banks else {"ok": False, "message": "无可用题库"}
+            return {"ok": only["ok"], "message": only["message"], "stats": stats}
+        summary = "；".join(f"{entry['name']}: {entry['message']}" for entry in banks)
+        return {"ok": ok, "message": summary, "stats": stats, "banks": banks}
 
     def notification_test(self) -> dict:
         try:

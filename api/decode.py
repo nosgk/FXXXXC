@@ -18,55 +18,138 @@ from api.logger import logger
 def decode_course_list(html_text: str) -> List[Dict[str, str]]:
     """
     解析课程列表页面，提取课程信息
-    
+
     Args:
         html_text: 课程列表页面的HTML内容
-        
+
     Returns:
-        课程信息列表，每个课程包含id、title、teacher等信息
+        课程信息列表，每个课程包含id、title、teacher等信息；
+        未开放课程不再丢弃，以 ``notOpen: True`` 标记返回（详细状态展示需要），
+        另附 best-effort 的 ``cover`` 封面地址。
     """
     logger.trace("开始解码课程列表...")
     soup = BeautifulSoup(html_text, "lxml")
+    # 官方两种结构：mooc2-ans interaction 渲染 div.course（字段藏在 input 里），
+    # 新版空间 mooc1-1 interaction 渲染 li.course（courseid/clazzid 直接挂属性）。
     raw_courses = soup.select("div.course")
+    parser = _parse_div_course
+    if not raw_courses:
+        raw_courses = soup.select("li.course")
+        parser = _parse_li_course
+
     course_list = []
-
     for course in raw_courses:
-        # 跳过未开放课程
-        if course.select_one("a.not-open-tip") or course.select_one("div.not-open-tip"):
+        course_detail = parser(course)
+        if course_detail is None:
             continue
-
-        clazz_input = course.select_one("input.clazzId")
-        course_input = course.select_one("input.courseId")
-        link = course.select_one("a")
-        name = course.select_one("span.course-name")
-        teacher = course.select_one("p.color3")
-        if not all((clazz_input, course_input, link, name, teacher)):
-            logger.warning("课程条目缺少必要字段，已跳过: {}", course.attrs.get("id", "?"))
-            continue
-
-        cpi_match = re.search(r"cpi=(.*?)&", link.attrs.get("href", ""))
-        if not cpi_match:
-            logger.warning("课程条目缺少 cpi 参数，已跳过: {}", course.attrs.get("id", "?"))
-            continue
-
-        course_detail = {
-            "id": course.attrs.get("id", ""),
-            "info": course.attrs.get("info", ""),
-            "roleid": course.attrs.get("roleid", ""),
-            "clazzId": clazz_input.attrs.get("value", ""),
-            "courseId": course_input.attrs.get("value", ""),
-            "cpi": cpi_match.group(1),
-            "title": name.attrs.get("title", ""),
-            "desc": (
-                course.select_one("p.margint10").attrs.get("title", "")
-                if course.select_one("p.margint10")
-                else ""
-            ),
-            "teacher": teacher.attrs.get("title", ""),
-        }
         course_list.append(course_detail)
 
     return course_list
+
+
+def _parse_div_course(course) -> Optional[Dict[str, str]]:
+    """解析旧版 div.course 结构。"""
+    # 未开放课程保留并打标，不再静默丢弃
+    not_open = bool(
+        course.select_one("a.not-open-tip") or course.select_one("div.not-open-tip")
+    )
+
+    clazz_input = course.select_one("input.clazzId")
+    course_input = course.select_one("input.courseId")
+    # 第一个 <a> 可能是无 href 的 not-open-tip 角标，必须选带链接的那个
+    link = course.select_one("a[href]")
+    name = course.select_one("span.course-name")
+    teacher = course.select_one("p.color3")
+    if not all((clazz_input, course_input, link, name, teacher)):
+        logger.warning("课程条目缺少必要字段，已跳过: {}", course.attrs.get("id", "?"))
+        return None
+
+    cpi_match = re.search(r"cpi=(.*?)&", link.attrs.get("href", ""))
+    if not cpi_match:
+        logger.warning("课程条目缺少 cpi 参数，已跳过: {}", course.attrs.get("id", "?"))
+        return None
+
+    return _course_detail_common(
+        course=course,
+        course_id=course_input.attrs.get("value", ""),
+        clazz_id=clazz_input.attrs.get("value", ""),
+        cpi=cpi_match.group(1),
+        title=name.attrs.get("title", ""),
+        teacher=teacher.attrs.get("title", ""),
+        not_open=not_open,
+        desc=(
+            course.select_one("p.margint10").attrs.get("title", "")
+            if course.select_one("p.margint10")
+            else ""
+        ),
+        element_id=course.attrs.get("id", ""),
+    )
+
+
+def _parse_li_course(course) -> Optional[Dict[str, str]]:
+    """解析新版空间 li.course 结构。"""
+    course_id = course.attrs.get("courseid", "")
+    clazz_id = course.attrs.get("clazzid", "")
+    if not course_id or not clazz_id:
+        logger.warning("课程条目缺少 courseid/clazzid，已跳过: {}", course.attrs.get("id", "?"))
+        return None
+
+    link = course.select_one('a[href*="stucoursemiddle"]')
+    cpi = ""
+    if link is not None:
+        cpi_match = re.search(r"cpi=(.*?)&", link.attrs.get("href", ""))
+        if cpi_match:
+            cpi = cpi_match.group(1)
+    name_tag = course.select_one(".course-name")
+    title = ""
+    if name_tag is not None:
+        title = name_tag.attrs.get("title", "") or name_tag.get_text(strip=True)
+    teacher_tag = course.select_one("p.line2") or course.select_one("p.color3")
+    teacher = ""
+    if teacher_tag is not None:
+        teacher = teacher_tag.attrs.get("title", "") or teacher_tag.get_text(strip=True)
+
+    return _course_detail_common(
+        course=course,
+        course_id=course_id,
+        clazz_id=clazz_id,
+        cpi=cpi,
+        title=title,
+        teacher=teacher,
+        not_open=False,
+        desc="",
+        element_id=course.attrs.get("id", ""),
+    )
+
+
+def _course_detail_common(
+    *,
+    course,
+    course_id: str,
+    clazz_id: str,
+    cpi: str,
+    title: str,
+    teacher: str,
+    not_open: bool,
+    desc: str,
+    element_id: str,
+) -> Dict[str, str]:
+    """组装课程字典；封面图从卡片内 img best-effort 提取。"""
+    cover = ""
+    img = course.select_one("img")
+    if img is not None:
+        cover = img.attrs.get("src") or img.attrs.get("data-src") or ""
+    return {
+        "id": element_id,
+        "courseId": course_id,
+        "clazzId": clazz_id,
+        "cpi": cpi,
+        "title": title,
+        "teacher": teacher,
+        "desc": desc,
+        "notOpen": not_open,
+        "cover": cover,
+    }
 
 
 def decode_course_folder(html_text: str) -> List[Dict[str, str]]:

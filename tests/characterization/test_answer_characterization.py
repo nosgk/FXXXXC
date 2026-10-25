@@ -23,7 +23,10 @@ def test_cut_splits_on_first_available_delimiter():
 def test_check_single_rejects_strong_delimiters():
     assert check_single("A") is True
     assert check_single("A. 文本") is True
-    assert check_single("A、B") is False
+    # 顿号是句内标点，不再视为多选分隔符（上游 PR #631）；
+    # 多选切分仍由 cut() 使用顿号。
+    assert check_single("A、B") is True
+    assert check_single("坚持独立负责、不参与国际组织的活动") is True
     assert check_single("A\nB") is False
 
 
@@ -43,7 +46,9 @@ def test_check_judgement_aliases():
 def test_check_answer_type_rules():
     stub = _TikuStub()
     assert check_answer("A", "single", stub) is True
-    assert check_answer("A、B", "single", stub) is False
+    # 顿号答案不再被误判为多选（上游 PR #631）
+    assert check_answer("A、B", "single", stub) is True
+    assert check_answer("A\nB", "single", stub) is False
     assert check_answer("A、B", "multiple", stub) is True
     assert check_answer("正确", "judgement", stub) is True
     assert check_answer("maybe", "judgement", stub) is False

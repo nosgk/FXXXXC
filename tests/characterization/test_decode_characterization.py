@@ -17,15 +17,55 @@ from api.decode import (
 )
 
 
-def test_decode_course_list_skips_not_open_courses():
+def test_decode_course_list_keeps_not_open_courses_flagged():
+    """未开放课程保留并打 notOpen 标记（课程详细状态展示需要），不再静默丢弃。"""
     courses = decode_course_list(fixture_text("html/course_list.html"))
 
-    assert [course["courseId"] for course in courses] == ["course-1", "course-2"]
+    assert [course["courseId"] for course in courses] == ["course-1", "course-2", "course-3"]
     assert courses[0]["clazzId"] == "clazz-1"
     assert courses[0]["cpi"] == "12345"
     assert courses[0]["title"] == "测试课程一"
     assert courses[0]["teacher"] == "张老师"
     assert courses[1]["desc"] == ""
+    assert courses[2]["notOpen"] is True
+    assert courses[2]["cpi"] == "1"
+    # 无封面条目的 cover 为空字符串，GUI 自行回退占位图
+    assert courses[0]["cover"] == ""
+
+
+def test_decode_course_list_supports_new_space_li_markup():
+    """新版空间（mooc1-1 interaction）的 li.course 结构也要能解析。"""
+    html = """
+    <ul class="course-list" id="courseList">
+      <li class="course clearfix" courseid="266406962" clazzid="155239611" personid="504500535"
+          id="course_266406962_155239611">
+        <div class="course-cover">
+          <a href="https://mooc1-1.chaoxing.com/mooc-ans/visit/stucoursemiddle?courseid=266406962&amp;clazzid=155239611&amp;vc=1&amp;cpi=504500535&amp;ismooc2=1&amp;v=2">
+            <img src="https://p.ananas.chaoxing.com/star3/240_130c/714d16b02f9b7012ac80c5daafabc4ba.png">
+          </a>
+        </div>
+        <div class="course-info">
+          <h3 class="inlineBlock">
+            <a class="color1" href="https://mooc1-1.chaoxing.com/mooc-ans/visit/stucoursemiddle?courseid=266406962&amp;clazzid=155239611&amp;vc=1&amp;cpi=504500535&amp;ismooc2=1&amp;v=2">
+              <span class="course-name overHidden2" title="就业指导（第6次开课）">就业指导（第6次开课）</span>
+            </a>
+          </h3>
+          <p class="line2" title="李心婳">李心婳</p>
+        </div>
+      </li>
+    </ul>
+    """
+    courses = decode_course_list(html)
+
+    assert len(courses) == 1
+    course = courses[0]
+    assert course["courseId"] == "266406962"
+    assert course["clazzId"] == "155239611"
+    assert course["cpi"] == "504500535"
+    assert course["title"] == "就业指导（第6次开课）"
+    assert course["teacher"] == "李心婳"
+    assert course["cover"] == "https://p.ananas.chaoxing.com/star3/240_130c/714d16b02f9b7012ac80c5daafabc4ba.png"
+    assert course["notOpen"] is False
 
 
 def test_decode_course_point_preserves_flags():

@@ -255,7 +255,7 @@ class AIRequestTestCase(unittest.TestCase):
         ai.http_proxy = ""
         siliconflow = answer.SiliconFlow()
         siliconflow.api_key = "test-key"
-        with patch("api.answer.OpenAI") as client, patch("api.answer.requests.post") as post:
+        with patch("api.answer._openai_client", return_value=Mock()) as client, patch("api.answer.requests.post") as post:
             for provider in (ai, siliconflow):
                 with self.subTest(provider=provider.name):
                     with patch("api.answer._image_data_url", side_effect=["data:image/png;base64,YQ==", None]):
@@ -264,7 +264,7 @@ class AIRequestTestCase(unittest.TestCase):
             post.assert_not_called()
 
     @patch("api.answer._get_image_response", return_value=_ImageResponse())
-    @patch("api.answer.OpenAI")
+    @patch("api.answer._openai_client")
     def test_ai_sends_multimodal_user_content(self, openai_cls, _get):
         captured = {}
 
@@ -295,7 +295,7 @@ class AIRequestTestCase(unittest.TestCase):
         self.assertTrue(any(part["type"] == "image_url" for part in user_message["content"]))
 
     @patch("api.answer._get_image_response", return_value=_ImageResponse())
-    @patch("api.answer.OpenAI")
+    @patch("api.answer._openai_client")
     def test_image_choice_requests_and_returns_option_letter(self, openai_cls, _get):
         captured = {}
 
