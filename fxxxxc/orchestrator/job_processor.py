@@ -46,6 +46,16 @@ class ChapterTask:
         return self.index < other.index
 
 
+def _emit(chaoxing, data: dict) -> None:
+    """Best-effort progress emission; CLI runs have no hook installed."""
+    emit = getattr(chaoxing, "emit_progress", None)
+    if callable(emit):
+        try:
+            emit(data)
+        except Exception:  # noqa: BLE001 - listeners must never break workers
+            pass
+
+
 def process_job(
     chaoxing: Chaoxing,
     course: dict,
@@ -55,6 +65,11 @@ def process_job(
 ) -> StudyResult:
     """Dispatch one task point to the appropriate study implementation."""
     job_type = job.get("type")
+    task_name = str(job.get("name") or job.get("jobid") or job_type or "unknown")
+    _emit(
+        chaoxing,
+        {"kind": str(job_type or "unknown"), "phase": "start", "name": task_name, "course": course.get("title", "")},
+    )
 
     if job_type == "video":
         logger.trace(f"识别到视频任务, 任务章节: {course.get('title', '')} 任务ID: {job.get('jobid', '')}")
@@ -66,19 +81,26 @@ def process_job(
             logger.warning(
                 f"出现异常任务 -> 任务章节: {course.get('title', '')} 任务ID: {job.get('jobid', '')}, 已跳过"
             )
+        _emit_job_result(chaoxing, job_type, task_name, course, video_result)
         return video_result
 
     if job_type == "document":
         logger.trace(f"识别到文档任务, 任务章节: {course.get('title', '')} 任务ID: {job.get('jobid', '')}")
-        return chaoxing.study_document(course, job)
+        result = chaoxing.study_document(course, job)
+        _emit_job_result(chaoxing, job_type, task_name, course, result)
+        return result
 
     if job_type == "workid":
         logger.trace(f"识别到章节检测任务, 任务章节: {course.get('title', '')}")
-        return chaoxing.study_work(course, job, job_info)
+        result = chaoxing.study_work(course, job, job_info)
+        _emit_job_result(chaoxing, job_type, task_name, course, result)
+        return result
 
     if job_type == "read":
         logger.trace(f"识别到阅读任务, 任务章节: {course.get('title', '')}")
-        return chaoxing.study_read(course, job, job_info)
+        result = chaoxing.study_read(course, job, job_info)
+        _emit_job_result(chaoxing, job_type, task_name, course, result)
+        return result
 
     if job_type == "live":
         logger.trace(f"识别到直播任务, 任务章节: {course.get('title', '')} 任务ID: {job.get('jobid', '')}")
@@ -101,13 +123,30 @@ def process_job(
             thread = threading.Thread(target=_run_live, daemon=True)
             thread.start()
             thread.join()
-            return StudyResult.SUCCESS if result_holder.get("ok") else StudyResult.ERROR
+            live_result = StudyResult.SUCCESS if result_holder.get("ok") else StudyResult.ERROR
+            _emit_job_result(chaoxing, job_type, task_name, course, live_result)
+            return live_result
         except Exception as exc:  # noqa: BLE001 - a live task must not kill the worker
             logger.error(f"处理直播任务时出错: {exc}")
+            _emit(chaoxing, {"kind": "live", "phase": "error", "name": task_name, "course": course.get("title", ""), "message": str(exc)})
             return StudyResult.ERROR
 
     logger.error(f"未知任务类型: {job_type}")
+    _emit(chaoxing, {"kind": "unknown", "phase": "error", "name": task_name, "course": course.get("title", ""), "message": f"未知任务类型: {job_type}"})
     return StudyResult.ERROR
+
+
+def _emit_job_result(chaoxing, job_type, task_name, course, result) -> None:
+    _emit(
+        chaoxing,
+        {
+            "kind": str(job_type or "unknown"),
+            "phase": "error" if result.is_failure() else "done",
+            "name": task_name,
+            "course": course.get("title", ""),
+            "result": result.name.lower(),
+        },
+    )
 
 
 class JobProcessor:
@@ -288,6 +327,18 @@ class JobProcessor:
                     should_stop=self.should_stop,
                 )
                 requeued = self._handle_result(task)
+                if requeued:
+                    _emit(
+                        self.chaoxing,
+                        {
+                            "kind": "chapter",
+                            "phase": "retry",
+                            "course": task.course.get("title", ""),
+                            "chapter": task.point.get("title", ""),
+                            "result": task.result.name.lower(),
+                            "tries": task.tries,
+                        },
+                    )
             except Exception as exc:  # noqa: BLE001 - a worker must never die silently
                 logger.error(
                     "处理章节异常: {} - {}: {}",
@@ -352,8 +403,27 @@ def process_chapter(
         return ChapterResult.ERROR
 
     logger.info(f'当前章节: {point.get("title", "")}')
+    _emit(
+        chaoxing,
+        {
+            "kind": "chapter",
+            "phase": "start",
+            "course": course.get("title", ""),
+            "chapter": point.get("title", ""),
+        },
+    )
     if point.get("has_finished"):
         logger.info(f'章节：{point.get("title", "")} 已完成所有任务点')
+        _emit(
+            chaoxing,
+            {
+                "kind": "chapter",
+                "phase": "done",
+                "course": course.get("title", ""),
+                "chapter": point.get("title", ""),
+                "result": "success",
+            },
+        )
         return ChapterResult.SUCCESS
 
     chaoxing.rate_limiter.limit_rate(random_time=True, random_min=0, random_max=0.2)
@@ -362,18 +432,48 @@ def process_chapter(
     job_info = job_info or {}
 
     if job_info.get("notOpen", False):
+        _emit(
+            chaoxing,
+            {
+                "kind": "chapter",
+                "phase": "done",
+                "course": course.get("title", ""),
+                "chapter": point.get("title", ""),
+                "result": "not_open",
+            },
+        )
         return ChapterResult.NOT_OPEN
 
     job_results: list[StudyResult] = []
     for job in jobs:
         if should_stop is not None and should_stop():
             logger.info("收到停止请求, 中断章节: {}", point.get("title", ""))
+            _emit(
+                chaoxing,
+                {
+                    "kind": "chapter",
+                    "phase": "error",
+                    "course": course.get("title", ""),
+                    "chapter": point.get("title", ""),
+                    "result": "stopped",
+                },
+            )
             return ChapterResult.ERROR
         job_results.append(process_job(chaoxing, course, job, job_info, speed))
 
-    if any(result.is_failure() for result in job_results):
-        return ChapterResult.ERROR
-    return ChapterResult.SUCCESS
+    failed = any(result.is_failure() for result in job_results)
+    _emit(
+        chaoxing,
+        {
+            "kind": "chapter",
+            "phase": "done" if not failed else "error",
+            "course": course.get("title", ""),
+            "chapter": point.get("title", ""),
+            "result": "error" if failed else "success",
+            "tasks": len(job_results),
+        },
+    )
+    return ChapterResult.ERROR if failed else ChapterResult.SUCCESS
 
 
 def filter_courses(all_course, course_list):

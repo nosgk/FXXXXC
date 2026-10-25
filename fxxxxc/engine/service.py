@@ -219,6 +219,9 @@ class EngineService:
         self._processor: JobProcessor | None = None
         self._worker: threading.Thread | None = None
         self._run_id = ""
+        self._run_started_at = 0.0
+        self._live: dict[str, Any] = {}
+        self._last_course_ids: list[str] = []
         self._manual_batches: dict[str, dict] = {}
         self._log_lines: deque[dict] = deque(maxlen=1000)
         self._log_sink_handle = None
@@ -475,12 +478,25 @@ class EngineService:
         with self._lock:
             if self._worker is not None and self._worker.is_alive():
                 raise RpcError(STUDY_ALREADY_RUNNING, "已有学习任务在运行")
-            course_ids = [str(item) for item in (params.get("course_ids") or [])]
+            course_ids = [str(item).strip() for item in (params.get("course_ids") or [])]
+            course_ids = [item for item in course_ids if item]
             if not course_ids:
                 raise RpcError(-32602, "study.start requires course_ids")
             options = params.get("options") or {}
             if not isinstance(options, dict):
                 raise RpcError(-32602, "study.start options must be an object")
+            if "notopen_action" in options:
+                allowed = sorted(_NOTOPEN_ACTIONS)
+                if str(options["notopen_action"]).strip().lower() not in _NOTOPEN_ACTIONS:
+                    raise RpcError(-32602, f"notopen_action 仅允许 {'/'.join(allowed)}")
+
+            # 选中课程引擎侧持久化（[engine] last_course_ids），GUI 重启后可恢复；
+            # 不写入 common.course_list，避免改变 CLI 的交互语义。
+            self._last_course_ids = course_ids
+            try:
+                self.config_set({"config": {"engine": {"last_course_ids": ",".join(course_ids)}}})
+            except RpcError:
+                pass
 
             self._run_id = f"run-{int(time.time())}-{uuid.uuid4().hex[:6]}"
             run_id = self._run_id
@@ -508,9 +524,27 @@ class EngineService:
 
     def _study_worker(self, run_id: str, course_ids: list[str], options: dict) -> None:
         processor: JobProcessor | None = None
+        chaoxing: Chaoxing | None = None
         try:
             self._set_state("loading", "正在准备学习任务")
             chaoxing = self._ensure_chaoxing()
+
+            # 进度钩子：引擎把底层任务事件转成 study.task 事件并维护实时快照，
+            # GUI 轮询 study.status 即可在重连后恢复全貌（双向同步的另一半）。
+            def _on_progress(data: dict) -> None:
+                with self._lock:
+                    self._live = dict(data)
+                self.bus.emit("study.task", {**data, "run_id": run_id})
+
+            with self._lock:
+                self._live = {}
+                self._run_started_at = time.time()
+            chaoxing.progress_hook = _on_progress
+            self.bus.emit(
+                "study.task",
+                {"kind": "run", "phase": "start", "run_id": run_id, "courses": len(course_ids)},
+            )
+
             config = self._options_for_run(options)
 
             with self._lock:
@@ -552,7 +586,8 @@ class EngineService:
             processor.run()
 
             failed = len(processor.failed_tasks)
-            detail = f"完成，失败章节 {failed}"
+            elapsed = max(0, int(time.time() - self._run_started_at))
+            detail = f"完成，失败章节 {failed}，用时 {elapsed // 60}分{elapsed % 60}秒" if elapsed else f"完成，失败章节 {failed}"
             self._set_state("idle", detail)
             self.bus.emit(
                 "study.progress",
@@ -563,12 +598,17 @@ class EngineService:
                     "failed": failed,
                 },
             )
+            self.bus.emit(
+                "study.task",
+                {"kind": "run", "phase": "finished", "run_id": run_id, "total": len(tasks), "failed": failed, "elapsed": elapsed},
+            )
 
             if config.get("add_learning_count"):
                 self._increase_learning_count(chaoxing, selected, config)
         except RpcError as exc:
             self._set_state("error", exc.message)
             self.bus.emit("study.progress", {"run_id": run_id, "phase": "error", "message": exc.message})
+            self.bus.emit("study.task", {"kind": "run", "phase": "error", "run_id": run_id, "message": exc.message})
         except Exception as exc:  # noqa: BLE001 - worker boundary
             logger.error("学习任务异常: {}", exc)
             self._set_state("error", f"{type(exc).__name__}: {exc}")
@@ -576,9 +616,13 @@ class EngineService:
                 "study.progress",
                 {"run_id": run_id, "phase": "error", "message": str(exc)},
             )
+            self.bus.emit("study.task", {"kind": "run", "phase": "error", "run_id": run_id, "message": str(exc)})
         finally:
+            if chaoxing is not None and chaoxing.progress_hook is not None:
+                chaoxing.progress_hook = None
             with self._lock:
                 self._processor = None
+                self._run_started_at = 0.0
                 if self._worker is threading.current_thread():
                     self._worker = None
 
@@ -618,6 +662,16 @@ class EngineService:
     def study_status(self) -> dict:
         processor = self._processor
         payload: dict[str, Any] = {"state": self.state(), "detail": self._state_detail}
+        with self._lock:
+            live = dict(self._live) if self._live else None
+            started_at = self._run_started_at
+            last_course_ids = list(self._last_course_ids)
+        if live:
+            payload["current"] = live
+        if started_at > 0:
+            payload["elapsed"] = max(0, int(time.time() - started_at))
+        if last_course_ids:
+            payload["last_course_ids"] = last_course_ids
         if processor is not None:
             total = len(processor.tasks)
             unfinished = processor.task_queue.unfinished_tasks
@@ -631,6 +685,14 @@ class EngineService:
             )
         elif self._chaoxing is not None:
             payload.update({"courses": len(self._courses)})
+        tiku = self._tiku
+        if tiku is not None:
+            get_stats = getattr(tiku, "get_stats", None)
+            if callable(get_stats):
+                try:
+                    payload["tiku_stats"] = get_stats()
+                except Exception:  # noqa: BLE001 - stats are best effort
+                    pass
         return payload
 
     # ------------------------------------------------------------------ logs
@@ -746,13 +808,15 @@ class EngineService:
             return {"ok": False, "message": str(exc)}
         if getattr(tiku, "DISABLE", False):
             return {"ok": False, "message": "题库未启用或配置无效"}
+        get_stats = getattr(tiku, "get_stats", None)
+        stats = get_stats() if callable(get_stats) else {}
         if hasattr(tiku, "check_llm_connection"):
             try:
                 ok = bool(tiku.check_llm_connection())
             except Exception as exc:  # noqa: BLE001
-                return {"ok": False, "message": str(exc)}
-            return {"ok": ok, "message": "连接正常" if ok else "连接失败"}
-        return {"ok": True, "message": "题库已启用"}
+                return {"ok": False, "message": str(exc), "stats": stats}
+            return {"ok": ok, "message": "连接正常" if ok else "连接失败", "stats": stats}
+        return {"ok": True, "message": "题库已启用", "stats": stats}
 
     def notification_test(self) -> dict:
         try:

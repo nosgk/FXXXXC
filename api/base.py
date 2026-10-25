@@ -6,7 +6,7 @@ import threading
 import time
 from enum import Enum, IntEnum
 from hashlib import md5
-from typing import Optional, Literal
+from typing import Callable, Optional, Literal
 
 import requests
 from loguru import logger
@@ -33,10 +33,8 @@ from fxxxxc.text import (
     _JUDGE_TRUE_SET,
     _parse_work_record_detail,
     _parse_work_record_list,
-    best_option_by_similarity,
     clean_res,
-    get_option_text,
-    is_subsequence,
+    match_option_letter,
     multi_cut,
     normalize_answer_text,
     normalize_text,
@@ -114,6 +112,11 @@ class ActivityType(IntEnum):
 
 
 class Chaoxing:
+    # 引擎可选注入的进度回调（CLI 为 None 时零开销）。回调异常必须被吞掉，
+    # 任何监听方的故障都不能中断学习线程。类级默认值保证绕过 __init__ 构造的
+    # 测试实例也拥有该属性。
+    progress_hook: Optional[Callable[[dict], None]] = None
+
     def __init__(self, account: Account = None, tiku: Tiku = None, **kwargs):
         self.account = account
         self.cipher = AESCipher()
@@ -123,6 +126,16 @@ class Chaoxing:
         self.rate_limiter = RateLimiter(0.5)  # 其他接口速率限制比较松
         self.video_log_limiter = RateLimiter(2)  # 上报进度极其容易卡验证码，限制2s一次
         self._cancel_event = threading.Event()
+        self.progress_hook = None
+
+    def emit_progress(self, data: dict) -> None:
+        hook = self.progress_hook
+        if hook is None:
+            return
+        try:
+            hook(data)
+        except Exception:  # noqa: BLE001 - progress must never break study
+            logger.debug("进度回调异常，已忽略")
 
     def cancel(self) -> None:
         """Request cancellation of long-running study loops."""
@@ -680,11 +693,41 @@ class Chaoxing:
 
         forbidden_retry = 0
         max_forbidden_retry = 2
+        # 终态确认重试上限：进度走到片尾后，平台偶尔不会立即确认 isPassed。
+        # 旧实现会在 100% 处每 1~2s 无限重发上报，表现为“进度卡 100% 不进入
+        # 下一个任务”。现在限制确认次数，超限后明确报错并把队列让给后续任务。
+        final_attempts = 0
+        max_final_attempts = 6
+
+        def _emit_video_progress() -> None:
+            self.emit_progress(
+                {
+                    "kind": _type.lower(),
+                    "phase": "progress",
+                    "name": _job.get("name", ""),
+                    "progress": round(min(1.0, max(0.0, play_time / duration)), 4) if duration > 0 else 0.0,
+                    "play_time": int(play_time),
+                    "duration": duration,
+                }
+            )
+
+        # 视频每秒只向外发一次进度事件，避免事件洪泛拖慢 GUI。
+        _last_emit_ts = [0.0]
+
+        def _emit_video_progress_throttled() -> None:
+            now = time.monotonic()
+            if now - _last_emit_ts[0] >= 1.0:
+                _last_emit_ts[0] = now
+                _emit_video_progress()
+
+        _last_emit_ts[0] = time.monotonic()
+        _emit_video_progress()
 
         passed, state = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, duration, duration,
                                                 _type, headers=headers, _isdrag=4)
         if passed:
             logger.info("任务瞬间完成: {}", _job.get("name", ""))
+            self.emit_progress({"kind": _type.lower(), "phase": "done", "name": _job.get("name", ""), "progress": 1.0})
             return StudyResult.SUCCESS
 
         pbar = None
@@ -694,7 +737,9 @@ class Chaoxing:
                     logger.info("收到取消请求, 停止视频任务: {}", _job.get("name", ""))
                     return StudyResult.ERROR
                 # Sometimes the last request needs to be sent several times to complete the task
-                if play_time - last_log_time >= wait_time or play_time == duration:
+                if play_time >= duration or play_time - last_log_time >= wait_time:
+                    if play_time >= duration:
+                        final_attempts += 1
 
                     passed, state = self.video_progress_log(_session, _course, _job, _job_info, _dtoken, duration,
                                                             int(play_time), _type, headers=headers)
@@ -720,6 +765,7 @@ class Chaoxing:
 
                             logger.debug("刷新后的令牌: {}, 持续时间: {}, 播放时间: {}", _dtoken, duration, play_time)
                             pbar = self._close_pbar_safe(pbar)
+                            final_attempts = 0
                             continue
                         else:
                             logger.error("会话恢复失败，刷新后的元数据缺少必要字段 (dtoken, duration)")
@@ -733,10 +779,30 @@ class Chaoxing:
 
                     logger.trace("Progress logged")
 
+                    # 进度已到片尾但平台仍未确认：有界重试后放行，避免死循环。
+                    if not passed and play_time >= duration:
+                        _emit_video_progress()
+                        if final_attempts >= max_final_attempts:
+                            logger.error(
+                                "视频进度已到片尾，但平台 {} 次上报均未确认完成 (jobid={}), "
+                                "跳过当前任务点以继续后续任务。建议稍后重跑或手动检查",
+                                final_attempts,
+                                _job.get("jobid", ""),
+                            )
+                            return StudyResult.ERROR
+                        logger.debug(
+                            "片尾确认第 {}/{} 次未通过, 稍后重试",
+                            final_attempts,
+                            max_final_attempts,
+                        )
+                        self._sleep(2)
+                        continue
+
                 # Uploading the progress takes time, we assume that the video is still playing in the background, this manually calculates the time elapsed
                 dt = (time.time() - last_iter) * _speed
                 last_iter = time.time()
                 play_time = min(duration, play_time + dt)
+                _emit_video_progress_throttled()
 
                 # 检查手动模式锁是否被锁定
                 manual_locked = False
@@ -759,6 +825,7 @@ class Chaoxing:
             pbar = self._close_pbar_safe(pbar)
 
         logger.info("任务完成: {}", _job.get("name", ""))
+        self.emit_progress({"kind": _type.lower(), "phase": "done", "name": _job.get("name", ""), "progress": 1.0})
         return StudyResult.SUCCESS
 
     def study_document(self, _course, _job) -> StudyResult:
@@ -969,23 +1036,14 @@ class Chaoxing:
                 else:
                     # 根据响应结果选择答案
                     if q["type"] == "multiple":
-                        # 多选处理
+                        # 多选处理：每项答案做逐级容错匹配（ocsjs AnswerUtil 策略）
                         options_list = multi_cut(q["options"], _ORIGIN_HTML_CONTENT)
                         res_list = multi_cut(res, _ORIGIN_HTML_CONTENT)
                         if res_list is not None and options_list is not None:
                             for _a in clean_res(res_list):
-                                matched = False
-                                for o in options_list:
-                                    if (
-                                            is_subsequence(_a, o)  # 去掉各种符号和前面ABCD的答案应当是选项的子序列
-                                    ):
-                                        answer += o[:1]
-                                        matched = True
-                                        break  # 找到匹配项后立即停止，防止重复添加
-                                if not matched:
-                                    best_letter = best_option_by_similarity(_a, options_list, threshold=0.8)
-                                    if best_letter:
-                                        answer += best_letter
+                                letter = match_option_letter(_a, options_list)
+                                if letter:
+                                    answer += letter
                             # 对答案进行排序, 否则会提交失败
                             answer = "".join(sorted(set(answer)))
                         # else 如果分割失败那么就直接到下面去随机选
@@ -994,12 +1052,8 @@ class Chaoxing:
                         options_list = multi_cut(q["options"], _ORIGIN_HTML_CONTENT)
                         if options_list is not None:
                             t_res = clean_res(res)
-                            for o in options_list:
-                                if is_subsequence(t_res[0], o):
-                                    answer = o[:1]
-                                    break
-                            if not answer and t_res:
-                                answer = best_option_by_similarity(t_res[0], options_list, threshold=0.8)
+                            if t_res:
+                                answer = match_option_letter(t_res[0], options_list)
                     elif q["type"] == "judgement":
                         if _has_image(q):
                             answer = _strict_judgement_answer(self.tiku, res)
@@ -1012,7 +1066,9 @@ class Chaoxing:
                             answer = "true" if self.tiku.judgement_select(res) else "false"
                     elif q["type"] == "completion":
                         if isinstance(res, list):
-                            answer = "".join(res)
+                            # 多空填空以 # 分隔（超星题库返回约定）；单空时行为不变
+                            blanks = [str(item).strip() for item in res if str(item).strip()]
+                            answer = "#".join(blanks)
                         elif isinstance(res, str):
                             answer = res
                     else:
@@ -1041,6 +1097,18 @@ class Chaoxing:
             else:
                 questions["pyFlag"] = "1"
                 logger.info(f"章节检测题库覆盖率低于{self.tiku.COVER_RATE * 100:.0f}%，不予提交")
+            self.emit_progress(
+                {
+                    "kind": "work",
+                    "phase": "stats",
+                    "name": str(_job.get("jobid", "")),
+                    "total": total_questions,
+                    "found": found_answers,
+                    "cover_rate": round(cover_rate, 1),
+                    "submitted": questions.get("pyFlag") == "",
+                    "redo_round": attempt,
+                }
+            )
             # 组建提交表单
             if questions["pyFlag"] == "1":
                 for q in questions["questions"]:
@@ -1110,6 +1178,16 @@ class Chaoxing:
 
             score = float(result_info.get("score", 0.0) or 0.0)
             unknown = int(result_info.get("unknown", 0) or 0)
+            self.emit_progress(
+                {
+                    "kind": "work",
+                    "phase": "scored",
+                    "name": str(_job.get("jobid", "")),
+                    "score": score,
+                    "all_correct": bool(result_info.get("all_correct", False)),
+                    "wrong": len(result_info.get("feedback", []) or []),
+                }
+            )
             if result_info.get("all_correct", False):
                 logger.info(f"章节检测全部正确（成绩 {score} 分），通过！")
                 return StudyResult.SUCCESS

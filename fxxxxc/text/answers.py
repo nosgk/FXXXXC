@@ -87,6 +87,52 @@ def best_option_by_similarity(target: str, options: list, threshold: float = 0.8
     return ""
 
 
+# 仅保留中/日/韩文字符与字母数字，用于容错全等比对（ocsjs AnswerUtil 的
+# “只保留中文数字英文”清洗策略）。
+_BARE_TEXT_RE = re.compile(r"[^0-9a-zA-Z\u4e00-\u9fff\u3040-\u30ff\u31f0-\u31ff\uac00-\ud7af]+")
+
+
+def _bare_text(text: str) -> str:
+    return _BARE_TEXT_RE.sub("", text or "")
+
+
+def match_option_letter(target, options, threshold: float = 0.8) -> str:
+    """ocsjs AnswerUtil 式选项字母匹配，逐级放宽：
+
+    1. 原文全等；
+    2. 归一化全等（去空白/标点/全半角差异）；
+    3. 仅保留中英日韩数字后全等（容忍缺失标点、大小写差异）；
+    4. 子序列匹配（答案字符按序出现在选项中）；
+    5. 相似度兜底（SequenceMatcher）。
+
+    命中返回选项字母（选项首字符），未命中返回空串。
+    """
+    if target is None or not options:
+        return ""
+    target_text = str(target).strip()
+    if not target_text:
+        return ""
+    target_norm = normalize_text(target_text)
+    target_bare = _bare_text(target_norm)
+
+    for option in options:
+        if get_option_text(option) == target_text:
+            return str(option)[:1]
+    if target_norm:
+        for option in options:
+            if normalize_text(get_option_text(option)) == target_norm:
+                return str(option)[:1]
+    if target_bare:
+        for option in options:
+            if _bare_text(normalize_text(get_option_text(option))) == target_bare:
+                return str(option)[:1]
+    if target_norm:
+        for option in options:
+            if is_subsequence(target_norm, get_option_text(option)):
+                return str(option)[:1]
+    return best_option_by_similarity(target_text, options, threshold)
+
+
 def is_subsequence(a, o):
     iter_o = iter(o.lower())
     return all(c in iter_o for c in a.lower())

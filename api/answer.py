@@ -614,13 +614,16 @@ class Tiku(ABC):
         """
         if self.DISABLE:
             return False
-        # 对响应的答案作处理
+        # 对响应的答案作处理：剥离题库常见的“【答案】/正确答案：/答案为”前缀与首尾标点，
+        # 再统一小写（对齐 ocsjs 判断题词法清洗）。
+        answer = re.sub(r"^(【答案】|\[答案\]|答案[:：为]|正确答案[:：为])\s*", "", str(answer).strip())
+        answer = answer.strip("。，,．.、；;：:!！？? \"'“”‘’")
         answer = answer.strip().lower()
 
         # 内置的高频通用判断词规整
-        if answer in ['true', 't', '1', '对', '正确', '√', '是', 'yes', 'y']:
+        if answer in ['true', 't', '1', '对', '正确', '√', '✔', '✓', '☑', '是', 'yes', 'y', 'right', 'correct']:
             return True
-        if answer in ['false', 'f', '0', '错', '错误', '×', '否', 'no', 'n', '不对', '不正确']:
+        if answer in ['false', 'f', '0', '错', '错误', '×', 'x', '✗', '✘', '☒', '否', 'no', 'n', '不对', '不正确', 'wrong', 'incorrect']:
             return False
 
         # 兼容自定义配置列表
@@ -660,6 +663,8 @@ class TikuFallback(Tiku):
         self.name = '多题库回退'
         self.providers = providers or []
         self.skip_answer_validation = True
+        # 每题库命中统计：{provider_key: {'queries': n, 'hits': n}}，供引擎/GUI 展示
+        self.stats: dict = {}
 
     def _init_tiku(self):
         active = []
@@ -677,12 +682,24 @@ class TikuFallback(Tiku):
         else:
             logger.info(f"多题库回退已启用，查询顺序: {', '.join([p.__class__.__name__ for p in self.providers])}")
 
+    def _provider_key(self, provider) -> str:
+        return f'{provider.name}({provider.__class__.__name__})'
+
+    def _stat_add(self, provider, field: str, count: int = 1) -> None:
+        entry = self.stats.setdefault(self._provider_key(provider), {'queries': 0, 'hits': 0})
+        entry[field] = entry.get(field, 0) + count
+
+    def get_stats(self) -> dict:
+        """返回 {provider_key: {'queries': n, 'hits': n}} 的拷贝。"""
+        return {key: dict(value) for key, value in self.stats.items()}
+
     def _query(self, q_info: dict) -> Optional[str]:
         for provider in self.providers:
+            self._stat_add(provider, 'queries')
             try:
                 answer = provider._query(q_info)
             except Exception as e:
-                provider_id = f'{provider.name}({provider.__class__.__name__})'
+                provider_id = self._provider_key(provider)
                 logger.exception(f'{self.name} 查询时 {provider_id} 异常: {e}')
                 continue
             if not answer:
@@ -692,6 +709,7 @@ class TikuFallback(Tiku):
             # 若当前题库返回答案但类型不符，则继续回退。
             if check_answer(answer, q_info['type'], provider):
                 logger.info(f'{provider.name} 命中答案')
+                self._stat_add(provider, 'hits')
                 return answer
 
             logger.info(f'{provider.name} 返回答案类型不符，回退到下一个题库')
@@ -708,10 +726,11 @@ class TikuFallback(Tiku):
                 continue
 
             sub_q_list = [q_list[idx] for idx in pending_indices]
+            self._stat_add(provider, 'queries', len(sub_q_list))
             try:
                 sub_results = provider.query_all(sub_q_list, query_delay=query_delay)
             except Exception as e:
-                provider_id = f'{provider.name}({provider.__class__.__name__})'
+                provider_id = self._provider_key(provider)
                 logger.exception(f'{self.name} 批量查询时 {provider_id} 异常: {e}')
                 continue
 
@@ -725,13 +744,16 @@ class TikuFallback(Tiku):
                 continue
 
             next_pending_indices = []
+            hit_count = 0
             for orig_idx, ans in zip(pending_indices, sub_results):
                 if ans:
                     logger.info(f'{provider.name} 命中答案: {q_list[orig_idx]["title"]} -> {ans}')
                     results[orig_idx] = ans
+                    hit_count += 1
                 else:
                     logger.info(f'{provider.name} 未命中或返回答案无效，将回退')
                     next_pending_indices.append(orig_idx)
+            self._stat_add(provider, 'hits', hit_count)
             pending_indices = next_pending_indices
 
         return results
