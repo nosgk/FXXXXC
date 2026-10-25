@@ -18,6 +18,8 @@ class ConnectionNotifier extends Notifier<ConnState> {
   Timer? _poll;
   Timer? _logFlush;
   final List<LogEntry> _logBuffer = [];
+  Timer? _activityFlush;
+  final List<TaskActivity> _activityBuffer = [];
   bool _starting = false;
 
   @override
@@ -27,6 +29,7 @@ class ConnectionNotifier extends Notifier<ConnState> {
       _sub?.cancel();
       _poll?.cancel();
       _logFlush?.cancel();
+      _activityFlush?.cancel();
       // Belt for container teardown; the window-close handler is the primary
       // kill path (dispose may not run before process teardown).
       unawaited(client.stop());
@@ -82,6 +85,9 @@ class ConnectionNotifier extends Notifier<ConnState> {
           }
         });
         break;
+      case 'study.task':
+        _onStudyTask(data);
+        break;
       case 'state.changed':
         ref.read(statusProvider.notifier).patchState(
               '${data['state'] ?? ''}',
@@ -105,14 +111,37 @@ class ConnectionNotifier extends Notifier<ConnState> {
     }
   }
 
+  void _onStudyTask(Map<String, dynamic> data) {
+    final activity = TaskActivity.fromJson(data, DateTime.now());
+    final statusNotifier = ref.read(statusProvider.notifier);
+    statusNotifier.applyTask(activity);
+
+    // 视频每秒的 progress 事件不进活动流，只更新“当前任务”快照，
+    // 否则活动流会被刷屏；其余事件进入流（同样合并 150ms 内的多条）。
+    if (!(activity.kind == 'video' || activity.kind == 'audio') || activity.phase != 'progress') {
+      _activityBuffer.add(activity);
+      _activityFlush ??= Timer(const Duration(milliseconds: 150), () {
+        final batch = List<TaskActivity>.of(_activityBuffer);
+        _activityBuffer.clear();
+        _activityFlush = null;
+        if (batch.isNotEmpty) {
+          ref.read(activityProvider.notifier).addAll(batch);
+        }
+      });
+    }
+  }
+
   Future<void> refreshStatus() async {
     if (state != ConnState.ready) return;
     try {
       final result = await ref.read(engineClientProvider).rpc('study.status');
       if (result is Map) {
-        ref.read(statusProvider.notifier).replace(
-              StudyStatus.fromJson((result).cast<String, dynamic>()),
-            );
+        final status = StudyStatus.fromJson((result).cast<String, dynamic>());
+        ref.read(statusProvider.notifier).replace(status);
+        // 双向同步的引擎半边：本地没有持久化选课时，恢复引擎侧上次的选课。
+        if (status.lastCourseIds.isNotEmpty) {
+          ref.read(selectedCoursesProvider.notifier).seedIfEmpty(status.lastCourseIds);
+        }
       }
     } on EngineException {
       // Engine is restarting; the next poll will retry.
@@ -161,6 +190,27 @@ class LogsNotifier extends Notifier<List<LogEntry>> {
 
 final logsProvider = NotifierProvider<LogsNotifier, List<LogEntry>>(LogsNotifier.new);
 
+class ActivityNotifier extends Notifier<List<TaskActivity>> {
+  static const _maxEntries = 80;
+
+  @override
+  List<TaskActivity> build() => const [];
+
+  void addAll(List<TaskActivity> entries) {
+    if (entries.isEmpty) return;
+    final next = [...entries.reversed, ...state];
+    if (next.length > _maxEntries) {
+      next.removeRange(_maxEntries, next.length);
+    }
+    state = next;
+  }
+
+  void clear() => state = const [];
+}
+
+/// 倒序活动流（最新在最上），仪表盘结构化展示的数据源。
+final activityProvider = NotifierProvider<ActivityNotifier, List<TaskActivity>>(ActivityNotifier.new);
+
 class StatusNotifier extends Notifier<StudyStatus> {
   @override
   StudyStatus build() => const StudyStatus();
@@ -170,15 +220,38 @@ class StatusNotifier extends Notifier<StudyStatus> {
 
   void patchState(String newState, String newDetail) {
     if (newState.isEmpty) return;
-    final current = state;
-    state = StudyStatus(
+    state = state.copyWith(
       state: newState,
-      detail: newDetail.isNotEmpty ? newDetail : current.detail,
-      total: current.total,
-      done: current.done,
-      failed: current.failed,
-      courses: current.courses,
+      detail: newDetail.isNotEmpty ? newDetail : null,
     );
+  }
+
+  /// 引擎 study.task 事件 → 状态快照（当前任务、覆盖率、成绩）。
+  void applyTask(TaskActivity activity) {
+    if (activity.kind == 'run') {
+      if (activity.phase == 'start') {
+        ref.read(activityProvider.notifier).clear();
+        // 新一轮运行：计数与当前任务快照全部归零。
+        state = StudyStatus(
+          state: 'loading',
+          detail: state.detail,
+          courses: state.courses,
+          tikuQueries: state.tikuQueries,
+          tikuHits: state.tikuHits,
+          lastCourseIds: state.lastCourseIds,
+        );
+      }
+      return;
+    }
+
+    StudyStatus next = state.copyWith(current: activity);
+    if (activity.kind == 'work' && activity.phase == 'stats' && activity.coverRate != null) {
+      next = next.copyWith(coverRate: activity.coverRate);
+    }
+    if (activity.kind == 'work' && activity.phase == 'scored' && activity.score != null) {
+      next = next.copyWith(lastScore: activity.score);
+    }
+    state = next;
   }
 }
 
@@ -230,6 +303,8 @@ class ManualNotifier extends Notifier<ManualQueue> {
 final manualProvider = NotifierProvider<ManualNotifier, ManualQueue>(ManualNotifier.new);
 
 class CoursesNotifier extends AsyncNotifier<List<Course>> {
+  bool _refreshing = false;
+
   @override
   Future<List<Course>> build() async {
     final client = ref.watch(engineClientProvider);
@@ -241,22 +316,30 @@ class CoursesNotifier extends AsyncNotifier<List<Course>> {
   }
 
   Future<void> refresh() async {
-    if (state.isLoading) return; // 防抖：进行中的刷新直接忽略
-    state = const AsyncLoading<List<Course>>();
-    state = await AsyncValue.guard(() async {
+    if (_refreshing) return; // 防抖：进行中的刷新直接忽略
+    _refreshing = true;
+    // 旧数据保留显示（stale-while-revalidate），避免每次刷新闪骨架屏。
+    try {
       final result = await ref.read(engineClientProvider).rpc('courses.list', {'refresh': true});
       final items = (result is Map ? result['courses'] as List? : null) ?? const [];
       final courses = items
           .map((item) => Course.fromJson((item as Map).cast<String, dynamic>()))
           .toList();
+      state = AsyncData(courses);
       // 状态同步：课程列表变化后修剪已失效的选课 ID。
       if (courses.isNotEmpty) {
         ref
             .read(selectedCoursesProvider.notifier)
             .retainAll(courses.map((course) => course.courseId).toSet());
       }
-      return courses;
-    });
+    } catch (error, stack) {
+      // 已有数据时保持展示，只把错误带出去；无数据才进入错误态。
+      if (state is! AsyncData<List<Course>>) {
+        state = AsyncError(error, stack);
+      }
+    } finally {
+      _refreshing = false;
+    }
   }
 }
 
@@ -278,6 +361,12 @@ class SelectedCoursesNotifier extends Notifier<Set<String>> {
     } catch (_) {
       // Persistence is best-effort; selection still works in-memory.
     }
+  }
+
+  /// 引擎半边：本地无选课时恢复引擎侧上次运行的选课集合。
+  void seedIfEmpty(List<String> courseIds) {
+    if (state.isNotEmpty || courseIds.isEmpty) return;
+    state = courseIds.toSet();
   }
 
   Future<void> _persist() async {

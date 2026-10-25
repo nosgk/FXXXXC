@@ -22,6 +22,81 @@ void main() {
     test('progress is zero without tasks', () {
       expect(const StudyStatus().progress, 0);
     });
+
+    test('parses current snapshot, elapsed and last course ids', () {
+      final status = StudyStatus.fromJson({
+        'state': 'running',
+        'elapsed': 95,
+        'last_course_ids': ['123', '456'],
+        'current': {'kind': 'video', 'phase': 'progress', 'name': '1.1 导论', 'progress': 0.42},
+        'tiku_stats': {
+          '甲库(TikuYanxi)': {'queries': 10, 'hits': 7},
+          '乙库(AI)': {'queries': 3, 'hits': 3},
+        },
+      });
+      expect(status.elapsed, 95);
+      expect(status.lastCourseIds, ['123', '456']);
+      expect(status.current, isNotNull);
+      expect(status.current!.kind, 'video');
+      expect(status.current!.progress, closeTo(0.42, 0.001));
+      expect(status.tikuQueries, 13);
+      expect(status.tikuHits, 10);
+      expect(status.hitRate, closeTo(10 / 13, 0.001));
+    });
+
+    test('hitRate is null without queries', () {
+      expect(const StudyStatus().hitRate, isNull);
+    });
+
+    test('copyWith keeps unspecified fields', () {
+      const base = StudyStatus(state: 'running', detail: 'd', total: 10, done: 2, failed: 1);
+      final next = base.copyWith(state: 'paused');
+      expect(next.state, 'paused');
+      expect(next.detail, 'd');
+      expect(next.total, 10);
+      expect(next.done, 2);
+      expect(next.failed, 1);
+    });
+  });
+
+  group('TaskActivity', () {
+    test('parses study.task payload', () {
+      final activity = TaskActivity.fromJson({
+        'kind': 'chapter',
+        'phase': 'done',
+        'course': '课程A',
+        'chapter': '第一章',
+        'result': 'success',
+      }, DateTime(2026, 1, 1));
+      expect(activity.kind, 'chapter');
+      expect(activity.isDone, isTrue);
+      expect(activity.isError, isFalse);
+    });
+
+    test('kindLabel maps known kinds', () {
+      expect(TaskActivity.kindLabel('video'), '视频');
+      expect(TaskActivity.kindLabel('work'), '章节检测');
+      expect(TaskActivity.kindLabel('mystery'), '任务');
+    });
+
+    test('describe formats stats and retry', () {
+      final stats = TaskActivity.fromJson({
+        'kind': 'work',
+        'phase': 'stats',
+        'name': 'work-1',
+        'cover_rate': 83.3,
+      });
+      expect(stats.describe(), contains('83%'));
+      final retry = TaskActivity.fromJson({
+        'kind': 'chapter',
+        'phase': 'retry',
+        'course': '课程A',
+        'chapter': '第二章',
+        'tries': 2,
+      });
+      expect(retry.describe(), contains('第 2 次'));
+      expect(retry.isRetry, isTrue);
+    });
   });
 
   group('Course', () {

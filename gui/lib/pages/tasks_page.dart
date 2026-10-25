@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../state.dart';
 import '../theme.dart';
+import 'dashboard_page.dart';
 
 class TasksPage extends ConsumerWidget {
   const TasksPage({super.key});
@@ -13,6 +14,7 @@ class TasksPage extends ConsumerWidget {
     final logs = ref.watch(logsProvider);
     final errors = logs.where((log) => log.level == 'ERROR').toList().reversed.take(30).toList();
     final color = statusColor(context, status.state);
+    final current = status.current;
 
     return ListView(
       padding: const EdgeInsets.all(24),
@@ -53,6 +55,37 @@ class TasksPage extends ConsumerWidget {
                 if (status.detail.isNotEmpty) ...[
                   const SizedBox(height: 12),
                   Text(status.detail, style: Theme.of(context).textTheme.bodyMedium),
+                ],
+                if (status.isRunning && current != null && current.kind != 'run') ...[
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      Icon(kindIcon(current.kind), size: 18, color: Theme.of(context).colorScheme.primary),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          current.describe(),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+                if (status.coverRate != null || status.lastScore != null) ...[
+                  const SizedBox(height: 12),
+                  Wrap(
+                    spacing: 16,
+                    runSpacing: 4,
+                    children: [
+                      if (status.coverRate != null)
+                        Text('题库覆盖率 ${status.coverRate!.toStringAsFixed(0)}%',
+                            style: Theme.of(context).textTheme.bodySmall),
+                      if (status.lastScore != null)
+                        Text('最近成绩 ${status.lastScore!.toStringAsFixed(0)} 分',
+                            style: Theme.of(context).textTheme.bodySmall),
+                    ],
+                  ),
                 ],
               ],
             ),
