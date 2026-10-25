@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import platform
 import threading
@@ -136,9 +137,11 @@ def validate_config_value(section: str, key: str, raw: str) -> tuple[str, str | 
         return str(min(high, max(low, int(value)))), None
     if pair in _ENUMS:
         text = value.strip().lower()
+        if text == "":
+            return "", None  # 留空 = 使用默认/不启用（GUI 提供空白选项）
         allowed = _ENUMS[pair]
         if text not in allowed:
-            return next(iter(sorted(allowed))), f"{section}.{key} 仅允许 {'/'.join(sorted(allowed))}"
+            return next(iter(sorted(allowed))), f"{section}.{key} 仅允许 {'/'.join(sorted(allowed))}（可留空）"
         return text, None
     if pair == ("tiku", "provider"):
         names = [part.strip() for part in value.split(",") if part.strip()]
@@ -150,9 +153,11 @@ def validate_config_value(section: str, key: str, raw: str) -> tuple[str, str | 
             return value, f"tiku.provider 未知题库: {', '.join(invalid)}"
         return ", ".join(names), None
     if pair == ("tiku", "manual_mode_separator"):
+        if value == "":
+            return ";", None  # 留空使用默认分隔符
         if value in _SEPARATORS:
             return value, None
-        return ";", "tiku.manual_mode_separator 仅允许 ; , space tab \\n"
+        return ";", "tiku.manual_mode_separator 仅允许 ; , space tab \\n（可留空）"
     return value.strip(), None
 
 
@@ -279,7 +284,10 @@ class EngineService:
             self._log_lines.append(entry)
             self.bus.emit("log", entry)
 
-        self._log_sink_handle = logger.add(sink, level=os.environ.get("FXXXXC_LOG_LEVEL", "INFO"))
+        # GUI 总线固定 INFO 起（流水账 DEBUG 不进 GUI）；需要细粒度时用
+        # FXXXXC_BUS_LOG_LEVEL 覆盖，与文件等级 FXXXXC_LOG_LEVEL 互不影响。
+        self._log_sink_handle = logger.add(
+            sink, level=os.environ.get("FXXXXC_BUS_LOG_LEVEL", "INFO"))
 
     def close(self) -> None:
         if self._log_sink_handle is not None:
@@ -312,6 +320,7 @@ class EngineService:
             "manual.answer": self.manual_answer,
             "manual.skip": self.manual_skip,
             "tiku.test": lambda p: self.tiku_test(),
+            "tiku.ocs.fetch": self.tiku_ocs_fetch,
             "notification.test": lambda p: self.notification_test(),
         }
         handler = handlers.get(method)
@@ -397,7 +406,7 @@ class EngineService:
             common["course_list"] = []
         common["speed"] = min(2.0, max(1.0, _as_float(raw.get("speed"), 1.0)))
         common["jobs"] = max(1, _as_int(raw.get("jobs"), 4))
-        common["notopen_action"] = raw.get("notopen_action", "retry")
+        common["notopen_action"] = raw.get("notopen_action") or "retry"
         common["retry_interval"] = max(0.0, _as_float(raw.get("retry_interval"), 1.0))
         common["work_max_retries"] = max(0, _as_int(raw.get("work_max_retries"), 3))
         common["work_redo_enabled"] = _as_bool(raw.get("work_redo_enabled"), False)
@@ -986,6 +995,54 @@ class EngineService:
         return {"ok": True}
 
     # -------------------------------------------------------------- testing
+
+    def tiku_ocs_fetch(self, params: dict) -> dict:
+        """从订阅链接自动获取 OCS（AnswererWrapper）题库配置 JSON。
+
+        支持直接返回配置 JSON 的任意题库站/订阅链接；文本中混有说明文字时
+        自动截取首个 ``[`` 到最后一个 ``]`` 的片段再解析。
+        """
+        url = str(params.get("url") or "").strip()
+        if not url.startswith(("http://", "https://")):
+            raise RpcError(-32602, "需要 http(s) 的题库配置订阅链接")
+
+        import requests
+
+        try:
+            resp = requests.get(
+                url, timeout=15,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            )
+        except requests.RequestException as exc:
+            raise RpcError(-32602, f"获取失败: {exc}") from exc
+        if resp.status_code != 200:
+            raise RpcError(-32602, f"获取失败: HTTP {resp.status_code}")
+
+        text = resp.text.strip()
+        candidates = [text]
+        start, end = text.find("["), text.rfind("]")
+        if 0 <= start < end:
+            candidates.append(text[start : end + 1])
+        for candidate in candidates:
+            try:
+                data = json.loads(candidate)
+            except ValueError:
+                continue
+            if isinstance(data, dict):
+                data = [data]
+            if not isinstance(data, list):
+                continue
+            valid = [
+                item for item in data
+                if isinstance(item, dict) and str(item.get("url", "") or "").strip()
+            ]
+            if valid:
+                return {
+                    "ok": True,
+                    "count": len(valid),
+                    "wrappers": json.dumps(valid, ensure_ascii=False),
+                }
+        raise RpcError(-32602, "链接内容不是可识别的 OCS 题库配置 JSON（需含 url 字段的对象数组）")
 
     def tiku_test(self) -> dict:
         try:

@@ -15,11 +15,77 @@ import json
 import struct
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from collections import OrderedDict
 from socketserver import ThreadingMixIn
 from urllib.parse import urlsplit
 
 from api.logger import logger
 from fxxxxc.engine.protocol import INVALID_PARAMS, METHOD_NOT_FOUND, RpcError
+
+# ---------------------------------------------------------------- 媒体代理
+
+# 只允许超星相关域名的图片走代理，防止本机服务被当成任意代理使用
+_MEDIA_ALLOWED_HOST_SUFFIXES = (
+    "chaoxing.com",
+    "chaoxing.cn",
+    "xuexitong.com",
+)
+_MEDIA_MAX_BYTES = 5 * 1024 * 1024
+_MEDIA_CACHE_MAX_ENTRIES = 300
+_MEDIA_CACHE: "OrderedDict[str, tuple[bytes, str]]" = OrderedDict()
+_MEDIA_HEADERS = {
+    # 官方图床按 Referer 防盗链：不带来源的直连请求会被拒绝
+    "Referer": "https://mooc2-ans.chaoxing.com/mooc2-ans/visit/interaction",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+    ),
+}
+
+
+def _media_host_allowed(url: str) -> bool:
+    try:
+        host = (urlsplit(url).hostname or "").rstrip(".").lower()
+    except ValueError:
+        return False
+    if not host:
+        return False
+    return any(
+        host == suffix or host.endswith("." + suffix)
+        for suffix in _MEDIA_ALLOWED_HOST_SUFFIXES
+    )
+
+
+def fetch_media(url: str) -> tuple[int, bytes, str]:
+    """拉取平台图片：命中内存缓存直接返回，否则带 Referer 回源。"""
+    import requests
+
+    if not url:
+        return 400, b"", ""
+    if not _media_host_allowed(url):
+        return 403, b"", ""
+
+    cached = _MEDIA_CACHE.get(url)
+    if cached is not None:
+        _MEDIA_CACHE.move_to_end(url)
+        return 200, cached[0], cached[1]
+
+    try:
+        resp = requests.get(url, headers=_MEDIA_HEADERS, timeout=(5, 15))
+    except requests.RequestException as exc:
+        logger.warning("媒体代理获取失败: {} ({})", url, exc)
+        return 502, b"", ""
+    if resp.status_code != 200 or not resp.content:
+        return 404, b"", ""
+    if len(resp.content) > _MEDIA_MAX_BYTES:
+        return 413, b"", ""
+
+    content_type = resp.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
+    _MEDIA_CACHE[url] = (resp.content, content_type)
+    _MEDIA_CACHE.move_to_end(url)
+    while len(_MEDIA_CACHE) > _MEDIA_CACHE_MAX_ENTRIES:
+        _MEDIA_CACHE.popitem(last=False)
+    return 200, resp.content, content_type
 
 _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 MAX_BODY = 1024 * 1024
@@ -151,7 +217,30 @@ class EngineHandler(BaseHTTPRequestHandler):
         if path == "/events":
             self._handle_websocket()
             return
+        if path == "/media":
+            self._handle_media()
+            return
         self._send_json(404, {"error": "not found"})
+
+    def _handle_media(self) -> None:
+        """本地媒体代理：为 GUI 图片带上平台 Referer（官方图床有防盗链）。
+
+        仅允许超星相关域名，结果带浏览器缓存头；引擎只绑定 127.0.0.1。
+        """
+        from urllib.parse import parse_qs, unquote
+
+        query = parse_qs(urlsplit(self.path).query)
+        target = unquote(query.get("url", [""])[0])
+        status, body, content_type = fetch_media(target)
+        if status != 200:
+            self._send_json(status, {"error": "media fetch failed"})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", content_type or "image/jpeg")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "max-age=86400")
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_POST(self):  # noqa: N802 - stdlib signature
         path = urlsplit(self.path).path

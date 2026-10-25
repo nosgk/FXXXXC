@@ -286,7 +286,7 @@ class Chaoxing:
         if _resp.status_code != 200:
             logger.error("读取课程列表失败: {}", _resp.status_code)
             return []
-        logger.info("课程列表读取完毕...")
+        logger.debug("课程列表读取完毕")
         course_list = decode_course_list(_resp.text)
 
         _interaction_url = "https://mooc2-ans.chaoxing.com/mooc2-ans/visit/interaction"
@@ -401,7 +401,7 @@ class Chaoxing:
             return {"hasLocked": False, "points": []}
 
         logger.trace(f"原始章节列表内容:\n{_resp.text}")
-        logger.info("课程章节读取成功...")
+        logger.debug("课程章节读取成功")
         return decode_course_point(_resp.text)
 
     def get_job_list(self, course: dict, point: dict) -> tuple[list[dict], dict]:
