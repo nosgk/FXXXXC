@@ -78,10 +78,15 @@ class _DashboardPageState extends ConsumerState<DashboardPage> {
 
     return Column(
       children: [
-        Padding(
-          padding: const EdgeInsets.fromLTRB(24, 16, 24, 0),
-          child: Column(
-            children: [
+        // 顶部信息区支持滚动：窗口高度不足时不再溢出裁切。
+        AutoScrollbar(
+          viewBuilder: (controller) => SingleChildScrollView(
+            controller: controller,
+            physics: const ClampingScrollPhysics(),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(24, 16, 24, 0),
+            child: Column(
+              children: [
               _RunHeader(
                 status: status,
                 selectedCount: selectedCount,
@@ -103,6 +108,8 @@ class _DashboardPageState extends ConsumerState<DashboardPage> {
               ],
             ],
           ),
+          ),
+        ),
         ),
         const SizedBox(height: 12),
         Expanded(

@@ -790,6 +790,21 @@ class _CourseDetailSheet extends ConsumerWidget {
                             label: '待解锁 ${detail.locked}',
                             color: kWarningColor,
                           ),
+                        if (detail.learnCount != null)
+                          _SummaryChip(
+                            icon: Icons.repeat_outlined,
+                            label: detail.learnTarget != null
+                                ? '学习次数 ${detail.learnCount}/${detail.learnTarget}'
+                                : '学习次数 ${detail.learnCount}',
+                          ),
+                        if (detail.score != null)
+                          _SummaryChip(
+                            icon: Icons.grade_outlined,
+                            label: '综合成绩 ${detail.score!.toStringAsFixed(1)}',
+                            color: (detail.score ?? 0) < 60
+                                ? kWarningColor
+                                : null,
+                          ),
                       ],
                     ),
                     const SizedBox(height: 10),

@@ -271,6 +271,10 @@ class EngineService:
         self._log_lines: deque[dict] = deque(maxlen=1000)
         self._log_sink_handle = None
         self._course_details: dict[tuple[str, str], tuple[float, dict]] = {}
+        # 学习次数阶段进度（算入总进度条，修复“章节跑完就显示 100%”的误显）
+        self._learn_active = False
+        self._learn_total = 0
+        self._learn_done = 0
         self._install_log_sink()
 
     # ------------------------------------------------------------------ meta
@@ -598,6 +602,112 @@ class EngineService:
         self.bus.emit("course.list", {"count": len(courses)})
         return {"courses": courses}
 
+    # 课程页常见成绩/学习次数文本模式（容错提取：命中不到就返回 None，绝不编数）
+    _SCORE_PATTERNS = (
+        r"综合成绩[^0-9]{0,20}(\d+(?:\.\d+)?)",
+        r"总成绩[^0-9]{0,20}(\d+(?:\.\d+)?)",
+        r"成绩[^0-9]{0,12}(\d+(?:\.\d+)?)\s*分",
+    )
+    _LEARN_COUNT_PATTERNS = (
+        r"学习次数[^0-9]{0,8}(\d+)\s*/\s*(\d+)",
+        r"学习次数[^0-9]{0,8}(\d+)",
+    )
+
+    def _fetch_course_extras(
+        self, course_id: str, clazz_id: str, cpi: str, first_point_id: str
+    ) -> dict:
+        """best-effort 读取课程的学习次数与综合成绩（解析不到返回 None）。
+
+        学习次数：章节学习页（studentstudyAjax，与刷次数流程同一接口）文案
+        “学习次数 x/y”，仅按次数考核的课程才有，其余返回 None。
+        综合成绩：门户页（stucoursemiddle 跳转落地）里平台自己暴露的
+        成绩/考核链接 → 跟随取页 → 容错匹配分数；不猜任何端点。
+        """
+        import re as re_mod
+        from urllib.parse import urljoin
+
+        import requests
+        from api.base import SessionManager
+
+        extras: dict = {"learn_count": None, "learn_target": None, "score": None}
+        session = SessionManager.get_session()
+
+        # --- 学习次数：章节学习页 ---
+        if first_point_id:
+            try:
+                resp = session.get(
+                    "https://mooc1.chaoxing.com/mooc-ans/mycourse/studentstudyAjax",
+                    params={
+                        "courseId": course_id,
+                        "clazzid": clazz_id,
+                        "chapterId": first_point_id,
+                        "cpi": cpi,
+                        "verificationcode": "",
+                        "mooc2": 1,
+                        "microTopicId": 0,
+                        "editorPreview": 0,
+                    },
+                    timeout=10,
+                )
+                if resp.status_code == 200:
+                    match = re_mod.search(
+                        r"学习次数[^0-9]{0,8}(\d+)\s*/\s*(\d+)", resp.text)
+                    if match:
+                        extras["learn_count"] = int(match.group(1))
+                        extras["learn_target"] = int(match.group(2))
+                    else:
+                        match = re_mod.search(
+                            r"学习次数[^0-9]{0,8}(\d+)", resp.text)
+                        if match:
+                            extras["learn_count"] = int(match.group(1))
+            except requests.RequestException as exc:
+                logger.debug("章节学习页获取异常 {}: {}", course_id, exc)
+
+        # --- 综合成绩：跟随门户页自己暴露的成绩链接 ---
+        portal_url = (
+            "https://mooc2-ans.chaoxing.com/mooc2-ans/visit/stucoursemiddle"
+            f"?courseid={course_id}&clazzid={clazz_id}&cpi={cpi}&ismooc2=1"
+        )
+        try:
+            portal = session.get(portal_url, timeout=12, allow_redirects=True)
+            if portal.status_code != 200:
+                return extras
+            # 平台自己暴露的链接：href 里带 assessment/score 的，或锚文本含 成绩/考核
+            candidates = re_mod.findall(
+                r'<a[^>]+href="([^"]*(?:assessment|score|Statistics)[^"]*)"',
+                portal.text, re_mod.IGNORECASE)
+            text_anchors = re_mod.findall(
+                r'<a[^>]+href="([^"]+)"[^>]*>[^<]{0,12}(?:成绩|考核)', portal.text)
+            seen: set[str] = set()
+            for link in [portal.url] if not candidates else []:
+                pass
+            for link in candidates + text_anchors:
+                absolute = urljoin(str(portal.url), link)
+                if absolute in seen:
+                    continue
+                seen.add(absolute)
+                if len(seen) > 3:
+                    break
+                try:
+                    page = session.get(absolute, timeout=12, allow_redirects=True)
+                except requests.RequestException:
+                    continue
+                if page.status_code != 200:
+                    continue
+                for pattern in self._SCORE_PATTERNS:
+                    match = re_mod.search(pattern, page.text)
+                    if match:
+                        try:
+                            extras["score"] = float(match.group(1))
+                        except ValueError:
+                            pass
+                        break
+                if extras["score"] is not None:
+                    break
+        except requests.RequestException as exc:
+            logger.debug("课程门户页请求异常 {}: {}", course_id, exc)
+        return extras
+
     def course_detail(self, params: dict) -> dict:
         """单门课程的章节状态明细（供 GUI 课程卡展开/预取）。
 
@@ -621,6 +731,9 @@ class EngineService:
 
         chaoxing = self._ensure_chaoxing()
         points = chaoxing.get_course_point(course_id, clazz_id, cpi)
+        raw_points = points.get("points", []) or []
+        first_point_id = str(raw_points[0].get("id", "")) if raw_points else ""
+        extras = self._fetch_course_extras(course_id, clazz_id, cpi, first_point_id)
         chapters = []
         for index, point in enumerate(points.get("points", [])):
             chapters.append(
@@ -640,6 +753,9 @@ class EngineService:
             "finished": sum(1 for chapter in chapters if chapter["finished"]),
             "locked": sum(1 for chapter in chapters if chapter["need_unlock"]),
             "has_locked": bool(points.get("hasLocked")),
+            "learn_count": extras["learn_count"],
+            "learn_target": extras["learn_target"],
+            "score": extras["score"],
         }
         with self._lock:
             if len(self._course_details) >= self.COURSE_DETAIL_CACHE_MAX:
@@ -676,6 +792,10 @@ class EngineService:
 
             self._run_id = f"run-{int(time.time())}-{uuid.uuid4().hex[:6]}"
             run_id = self._run_id
+            with self._lock:
+                self._learn_active = False
+                self._learn_total = 0
+                self._learn_done = 0
             worker = threading.Thread(
                 target=self._study_worker,
                 args=(run_id, course_ids, options),
@@ -808,11 +928,22 @@ class EngineService:
     def _increase_learning_count(self, chaoxing: Chaoxing, courses: list[dict], config: dict) -> None:
         from api.process import increase_learning_count_for_course
 
-        for course in courses:
-            if chaoxing.should_stop():
-                break
-            self._set_state("running", f"增加章节学习次数：{course.get('title', '')}")
-            increase_learning_count_for_course(chaoxing, course, config)
+        # 学习次数阶段计入总进度：每门课占 1 个进度单位，与章节数一起折算
+        with self._lock:
+            self._learn_active = True
+            self._learn_total = len(courses)
+            self._learn_done = 0
+        try:
+            for course in courses:
+                if chaoxing.should_stop():
+                    break
+                self._set_state("running", f"增加章节学习次数：{course.get('title', '')}")
+                increase_learning_count_for_course(chaoxing, course, config)
+                with self._lock:
+                    self._learn_done += 1
+        finally:
+            with self._lock:
+                self._learn_active = False
 
     def study_pause(self) -> dict:
         processor = self._processor
@@ -868,13 +999,25 @@ class EngineService:
         if processor is not None:
             total = len(processor.tasks)
             unfinished = processor.task_queue.unfinished_tasks
+            done = max(0, total - unfinished)
+            # 学习次数阶段进行中时折入总进度：total += 课程门数, done += 已完成门数。
+            # 否则章节一跑完进度条就停在 100%，看起来“任务已完成”而实际还在刷次数。
+            learn_active = self._learn_active
+            if learn_active:
+                total += self._learn_total
+                done += self._learn_done
             payload.update(
                 {
                     "run_id": self._run_id,
                     "total": total,
-                    "done": max(0, total - unfinished),
+                    "done": min(done, total),
                     "failed": len(processor.failed_tasks),
                     "courses_progress": self._courses_progress(processor),
+                    "learn": {
+                        "active": learn_active,
+                        "done": self._learn_done,
+                        "total": self._learn_total,
+                    },
                 }
             )
         elif self._chaoxing is not None:

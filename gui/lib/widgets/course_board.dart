@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../core/models.dart';
 import '../state.dart';
+import '../theme.dart';
 import '../widgets/skeleton.dart';
 
 /// 三栏课程看板（活动流的重设计）：进行中 / 待进行 / 已完成。
@@ -115,6 +116,38 @@ class CourseBoardPanel extends ConsumerWidget {
 
 enum BoardColumnKind { active, pending, done }
 
+/// 自带 ScrollController 的滚动条容器：多个纵向滚动视图并存时
+/// 不允许共用 PrimaryScrollController，各自持有控制器即可。
+class AutoScrollbar extends StatefulWidget {
+  const AutoScrollbar({super.key, required this.viewBuilder});
+
+  /// 用回传的 controller 构建滚动视图（ListView/SingleChildScrollView），
+  /// 保证滚动条与唯一 ScrollPosition 绑定。
+  final Widget Function(ScrollController controller) viewBuilder;
+
+  @override
+  State<AutoScrollbar> createState() => _AutoScrollbarState();
+}
+
+class _AutoScrollbarState extends State<AutoScrollbar> {
+  final ScrollController _controller = ScrollController();
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scrollbar(
+      controller: _controller,
+      thumbVisibility: true,
+      child: widget.viewBuilder(_controller),
+    );
+  }
+}
+
 class BoardEntry {
   const BoardEntry({
     required this.courseId,
@@ -125,6 +158,8 @@ class BoardEntry {
     required this.column,
     this.current,
     this.last,
+    this.detail,
+    this.activity = const [],
   });
 
   final String courseId;
@@ -137,6 +172,10 @@ class BoardEntry {
   final TaskActivity? current;
   /// 该课程最近一条任务事件（任意列）。
   final TaskActivity? last;
+  /// 章节明细（course.detail 仓库；空闲/已读取时可用）。
+  final CourseDetail? detail;
+  /// 该课程的近期任务事件（展开详情用，最新在前）。
+  final List<TaskActivity> activity;
 
   double? get progress =>
       total <= 0 ? null : (done / total).clamp(0.0, 1.0);
@@ -166,10 +205,14 @@ List<BoardEntry> buildBoardEntries(
 
   final currentId = status.current?.courseId ?? '';
   final entries = <BoardEntry>[];
+  final courseById = {for (final course in courses) course.courseId: course};
 
   if (status.progressByCourse.isNotEmpty) {
     for (final progress in status.coursesProgress) {
       final last = lastByCourse['id:${progress.courseId}'];
+      final course = courseById[progress.courseId];
+      final detail =
+          course == null ? null : details[course.detailKey]?.value;
       final completed = progress.total > 0 && progress.done >= progress.total;
       final recent =
           last?.atTs != null && now.difference(last!.atTs!).inSeconds < 45;
@@ -188,6 +231,13 @@ List<BoardEntry> buildBoardEntries(
         column: kind,
         current: isCurrent ? status.current : null,
         last: last,
+        detail: detail,
+        activity: [
+          for (final item in activity)
+            if (item.courseId == progress.courseId ||
+                (item.courseId.isEmpty && item.course == progress.title))
+              item,
+        ],
       ));
     }
     return entries;
@@ -209,6 +259,11 @@ List<BoardEntry> buildBoardEntries(
       column: completed ? BoardColumnKind.done : BoardColumnKind.pending,
       current: null,
       last: lastByCourse['id:${course.courseId}'],
+      detail: detail,
+      activity: [
+        for (final item in activity)
+          if (item.courseId == course.courseId) item,
+      ],
     ));
   }
   return entries;
@@ -221,6 +276,7 @@ class _BoardColumn extends StatelessWidget {
     required this.color,
     required this.entries,
   });
+
 
   final String title;
   final IconData icon;
@@ -261,12 +317,15 @@ class _BoardColumn extends StatelessWidget {
                       style: theme.textTheme.bodySmall
                           ?.copyWith(color: theme.colorScheme.outline)),
                 )
-              : ListView.builder(
-                  padding: const EdgeInsets.fromLTRB(10, 2, 10, 12),
-                  itemCount: entries.length,
-                  addAutomaticKeepAlives: false,
-                  itemBuilder: (context, index) =>
-                      _BoardCard(entry: entries[index]),
+              : AutoScrollbar(
+                  viewBuilder: (controller) => ListView.builder(
+                    controller: controller,
+                    padding: const EdgeInsets.fromLTRB(10, 2, 10, 12),
+                    itemCount: entries.length,
+                    addAutomaticKeepAlives: false,
+                    itemBuilder: (context, index) =>
+                        _BoardCard(entry: entries[index]),
+                  ),
                 ),
         ),
       ],
@@ -274,10 +333,19 @@ class _BoardColumn extends StatelessWidget {
   }
 }
 
-class _BoardCard extends StatelessWidget {
+class _BoardCard extends StatefulWidget {
   const _BoardCard({required this.entry});
 
   final BoardEntry entry;
+
+  @override
+  State<_BoardCard> createState() => _BoardCardState();
+}
+
+class _BoardCardState extends State<_BoardCard> {
+  bool _expanded = false;
+
+  BoardEntry get entry => widget.entry;
 
   @override
   Widget build(BuildContext context) {
@@ -314,6 +382,34 @@ class _BoardCard extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          InkWell(
+            onTap: () => setState(() => _expanded = !_expanded),
+            child: Row(
+              children: [
+                Icon(_expanded ? Icons.expand_less : Icons.expand_more,
+                    size: 18, color: scheme.outline),
+                const SizedBox(width: 4),
+                Text('详情',
+                    style: theme.textTheme.labelSmall
+                        ?.copyWith(color: scheme.outline)),
+                const Spacer(),
+                if (entry.detail?.score != null)
+                  Text('成绩 ${entry.detail!.score!.toStringAsFixed(0)}',
+                      style: theme.textTheme.labelSmall
+                          ?.copyWith(color: scheme.outline)),
+                if (entry.detail?.learnCount != null) ...[
+                  const SizedBox(width: 8),
+                  Text(
+                    '学习次数 ${entry.detail!.learnCount}'
+                    '${entry.detail!.learnTarget != null ? '/${entry.detail!.learnTarget}' : ''}',
+                    style: theme.textTheme.labelSmall
+                        ?.copyWith(color: scheme.outline),
+                  ),
+                ],
+              ],
+            ),
+          ),
+          const SizedBox(height: 6),
           Row(
             children: [
               Expanded(
@@ -387,6 +483,131 @@ class _BoardCard extends StatelessWidget {
               ),
             ],
           ),
+          AnimatedSwitcher(
+            duration: const Duration(milliseconds: 160),
+            transitionBuilder: (child, animation) =>
+                SizeTransition(sizeFactor: animation, child: child),
+            child: _expanded
+                ? _BoardCardDetail(key: const ValueKey('bd'), entry: entry)
+                : const SizedBox(width: double.infinity, key: ValueKey('bc')),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 展开详情：实时任务进度 + 章节颗粒（完成/待学/锁定色点）+ 近期任务事件。
+class _BoardCardDetail extends StatelessWidget {
+  const _BoardCardDetail({super.key, required this.entry});
+
+  final BoardEntry entry;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    final chapters = entry.detail?.chapters ?? const <ChapterStatus>[];
+    final events = entry.activity.take(6).toList();
+
+    return Padding(
+      padding: const EdgeInsets.only(top: 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (entry.current != null && entry.current!.progress != null) ...[
+            Row(
+              children: [
+                Icon(boardKindIcon(entry.current!.kind),
+                    size: 13, color: scheme.primary),
+                const SizedBox(width: 5),
+                Expanded(
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(3),
+                    child: LinearProgressIndicator(
+                      value: entry.current!.progress,
+                      minHeight: 4,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 6),
+                Text('${(entry.current!.progress! * 100).toStringAsFixed(0)}%',
+                    style: theme.textTheme.labelSmall
+                        ?.copyWith(color: scheme.primary)),
+              ],
+            ),
+            const SizedBox(height: 6),
+          ],
+          if (chapters.isNotEmpty) ...[
+            Wrap(
+              spacing: 5,
+              runSpacing: 5,
+              children: [
+                for (final chapter in chapters)
+                  Tooltip(
+                    message:
+                        '${chapter.index + 1}. ${chapter.title}'
+                        '${chapter.finished ? ' · 已完成' : chapter.needUnlock ? ' · 待解锁' : ' · 待学习'}'
+                        '${chapter.jobCount > 0 ? ' · ${chapter.jobCount}个任务点' : ''}',
+                    child: Container(
+                      width: 22,
+                      height: 22,
+                      alignment: Alignment.center,
+                      decoration: BoxDecoration(
+                        color: chapter.finished
+                            ? scheme.tertiaryContainer
+                            : chapter.needUnlock
+                                ? kWarningColor.withValues(alpha: 0.22)
+                                : scheme.surfaceContainerHighest,
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                      child: Text(
+                        '${chapter.index + 1}',
+                        style: theme.textTheme.labelSmall?.copyWith(
+                          color: chapter.finished
+                              ? scheme.onTertiaryContainer
+                              : scheme.onSurfaceVariant,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 6),
+          ],
+          if (events.isNotEmpty)
+            for (final event in events)
+              Padding(
+                padding: const EdgeInsets.only(top: 3),
+                child: Row(
+                  children: [
+                    Icon(boardKindIcon(event.kind),
+                        size: 11,
+                        color: event.isError
+                            ? scheme.error
+                            : event.isDone
+                                ? scheme.tertiary
+                                : scheme.outline),
+                    const SizedBox(width: 5),
+                    Expanded(
+                      child: Text(
+                        activityTitle(event),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.labelSmall
+                            ?.copyWith(color: scheme.onSurfaceVariant),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+          if (chapters.isEmpty &&
+              events.isEmpty &&
+              entry.current == null)
+            Text('暂无章节数据 · 课程页打开详情或运行后自动补充',
+                style: theme.textTheme.labelSmall
+                    ?.copyWith(color: scheme.outline)),
         ],
       ),
     );

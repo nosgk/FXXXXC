@@ -81,6 +81,9 @@ class CourseDetail {
     required this.finished,
     required this.locked,
     required this.hasLocked,
+    this.learnCount,
+    this.learnTarget,
+    this.score,
   });
 
   final String courseId;
@@ -90,6 +93,11 @@ class CourseDetail {
   final int finished;
   final int locked;
   final bool hasLocked;
+  /// 课程学习次数（平台按次数考核的课程才有；best-effort 可能为 null）。
+  final int? learnCount;
+  final int? learnTarget;
+  /// 课程综合成绩（best-effort，可能为 null）。
+  final double? score;
 
   double? get progress => total <= 0 ? null : (finished / total).clamp(0.0, 1.0);
 
@@ -106,6 +114,9 @@ class CourseDetail {
       finished: (json['finished'] as num?)?.toInt() ?? 0,
       locked: (json['locked'] as num?)?.toInt() ?? 0,
       hasLocked: json['has_locked'] == true,
+      learnCount: (json['learn_count'] as num?)?.toInt(),
+      learnTarget: (json['learn_target'] as num?)?.toInt(),
+      score: (json['score'] as num?)?.toDouble(),
     );
   }
 }
@@ -271,6 +282,9 @@ class StudyStatus {
     this.tikuHits = 0,
     this.bankStats = const [],
     this.coursesProgress = const [],
+    this.learnActive = false,
+    this.learnDone = 0,
+    this.learnTotal = 0,
     this.coverRate,
     this.lastScore,
   });
@@ -291,6 +305,10 @@ class StudyStatus {
   final List<BankStat> bankStats;
   /// 本轮运行每门课程的实时进度。
   final List<CourseProgress> coursesProgress;
+  /// 学习次数阶段（已折入总进度；用于运行条正确显示“进行中”）。
+  final bool learnActive;
+  final int learnDone;
+  final int learnTotal;
   final double? coverRate;
   final double? lastScore;
 
@@ -319,6 +337,9 @@ class StudyStatus {
     int? tikuHits,
     List<BankStat>? bankStats,
     List<CourseProgress>? coursesProgress,
+    bool? learnActive,
+    int? learnDone,
+    int? learnTotal,
     double? coverRate,
     double? lastScore,
   }) =>
@@ -336,6 +357,9 @@ class StudyStatus {
         tikuHits: tikuHits ?? this.tikuHits,
         bankStats: bankStats ?? this.bankStats,
         coursesProgress: coursesProgress ?? this.coursesProgress,
+        learnActive: learnActive ?? this.learnActive,
+        learnDone: learnDone ?? this.learnDone,
+        learnTotal: learnTotal ?? this.learnTotal,
         coverRate: coverRate ?? this.coverRate,
         lastScore: lastScore ?? this.lastScore,
       );
@@ -343,6 +367,7 @@ class StudyStatus {
   factory StudyStatus.fromJson(Map<String, dynamic> json) {
     final currentJson = json['current'];
     final tikuStats = json['tiku_stats'];
+    final learn = json['learn'];
     var queries = 0;
     var hits = 0;
     final banks = <BankStat>[];
@@ -381,6 +406,9 @@ class StudyStatus {
           .whereType<Map>()
           .map((item) => CourseProgress.fromJson(item.cast<String, dynamic>()))
           .toList(),
+      learnActive: (learn is Map ? learn['active'] as bool? : null) ?? false,
+      learnDone: (learn is Map ? learn['done'] as num? : null)?.toInt() ?? 0,
+      learnTotal: (learn is Map ? learn['total'] as num? : null)?.toInt() ?? 0,
     );
   }
 }
