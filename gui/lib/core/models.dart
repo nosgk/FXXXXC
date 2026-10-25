@@ -174,6 +174,8 @@ class TaskActivity {
     this.coverRate,
     this.score,
     this.tries,
+    this.count,
+    this.target,
     this.atTs,
   });
 
@@ -188,6 +190,9 @@ class TaskActivity {
   final double? coverRate;
   final double? score;
   final int? tries;
+  /// 学习次数阶段进度：count/target。
+  final int? count;
+  final int? target;
   final DateTime? atTs;
 
   bool get isError => phase == 'error';
@@ -206,6 +211,8 @@ class TaskActivity {
         coverRate: (json['cover_rate'] as num?)?.toDouble(),
         score: (json['score'] as num?)?.toDouble(),
         tries: (json['tries'] as num?)?.toInt(),
+        count: (json['count'] as num?)?.toInt(),
+        target: (json['target'] as num?)?.toInt(),
         atTs: at,
       );
 
@@ -219,7 +226,7 @@ class TaskActivity {
       case 'finished':
         return message ?? '本轮任务已结束';
       case 'stats':
-        return '题库覆盖率 ${coverRate!.toStringAsFixed(0)}%（$name）';
+        return '答题覆盖率 ${coverRate!.toStringAsFixed(0)}%（$name）';
       case 'scored':
         return '章节检测成绩 $score 分（$name）';
       case 'retry':
@@ -240,6 +247,7 @@ class TaskActivity {
         'work' => '章节检测',
         'read' => '阅读',
         'live' => '直播',
+        'learn' => '学习次数',
         _ => '任务',
       };
 }

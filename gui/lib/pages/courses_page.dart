@@ -220,8 +220,8 @@ class _CoursesHeaderState extends ConsumerState<_CoursesHeader> {
               const SizedBox(width: 4),
               FilledButton.tonalIcon(
                 onPressed: () {
-                  // 刷新课程列表时一并让章节详情回源。
-                  ref.invalidate(courseDetailProvider);
+                  // 刷新课程列表并清空章节详情仓库（卡片随后按需各读一次）。
+                  ref.read(courseDetailStoreProvider.notifier).clearAll();
                   ref.read(coursesProvider.notifier).refresh();
                 },
                 icon: const Icon(Icons.refresh, size: 18),
@@ -310,14 +310,32 @@ class _FilterChip extends StatelessWidget {
 
 // -------------------------------------------------------------------- 课程卡
 
-class _CourseCard extends ConsumerWidget {
+class _CourseCard extends ConsumerStatefulWidget {
   const _CourseCard({super.key, required this.course, this.live});
 
   final Course course;
   final CourseProgress? live;
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<_CourseCard> createState() => _CourseCardState();
+}
+
+class _CourseCardState extends ConsumerState<_CourseCard> {
+  Course get course => widget.course;
+
+  @override
+  void initState() {
+    super.initState();
+    // 读一次：仅在仓库没有该课程详情时触发，读完即止。
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      ref.read(courseDetailStoreProvider.notifier).ensure(course.detailKey);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final ref = this.ref;
     final selected = ref.watch(
       selectedCoursesProvider.select((set) => set.contains(course.courseId)),
     );
@@ -363,7 +381,7 @@ class _CourseCard extends ConsumerWidget {
                           ?.copyWith(color: scheme.outline),
                     ),
                     const Spacer(),
-                    _CardProgress(course: course, live: live),
+                    _CardProgress(course: course, live: widget.live),
                   ],
                 ),
               ),
@@ -540,8 +558,10 @@ class _CardProgress extends ConsumerWidget {
       );
     }
 
-    final detailAsync = ref.watch(courseDetailProvider(course.detailKey));
-    final detail = detailAsync.value;
+    final detailAsync = ref.watch(
+      courseDetailStoreProvider.select((store) => store[course.detailKey]),
+    );
+    final detail = detailAsync?.value;
     if (detail != null && detail.total > 0) {
       final done = detail.finished == detail.total;
       return _ProgressRow(
@@ -645,7 +665,11 @@ class _CourseDetailSheet extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final detailAsync = ref.watch(courseDetailProvider(course.detailKey));
+    // store 无条目（或正在加载）都按加载态渲染；刷新/重试走 refresh(force)。
+    final detailAsync = ref.watch(
+          courseDetailStoreProvider.select((store) => store[course.detailKey]),
+        ) ??
+        const AsyncLoading<CourseDetail>();
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
 
@@ -676,8 +700,9 @@ class _CourseDetailSheet extends ConsumerWidget {
               ),
               IconButton(
                 tooltip: '刷新章节状态',
-                onPressed: () =>
-                    ref.invalidate(courseDetailProvider(course.detailKey)),
+                onPressed: () => ref
+                    .read(courseDetailStoreProvider.notifier)
+                    .refresh(course.detailKey),
                 icon: const Icon(Icons.refresh),
               ),
               IconButton(
@@ -695,7 +720,9 @@ class _CourseDetailSheet extends ConsumerWidget {
             error: (error, _) => Expanded(
               child: _DetailError(
                 message: '$error',
-                onRetry: () => ref.invalidate(courseDetailProvider(course.detailKey)),
+                onRetry: () => ref
+                    .read(courseDetailStoreProvider.notifier)
+                    .refresh(course.detailKey),
               ),
             ),
             data: (detail) {

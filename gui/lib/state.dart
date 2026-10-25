@@ -119,9 +119,9 @@ class ConnectionNotifier extends Notifier<ConnState> {
               (data['index'] as num?)?.toInt() ?? -1,
             );
         break;
-      case 'course.list':
-        ref.read(coursesProvider.notifier).refresh();
-        break;
+      // 注意：不处理 course.list 事件 —— 引擎在每次 courses.list RPC 后都会发它，
+      // GUI 若据此刷新课程会形成“刷新→事件→再刷新”的无限读取回环。
+      // 课程页是拉取式：只在用户进入/手动刷新时读。
       default:
         break;
     }
@@ -321,7 +321,8 @@ final manualProvider = NotifierProvider<ManualNotifier, ManualQueue>(ManualNotif
 class CoursesNotifier extends AsyncNotifier<List<Course>> {
   bool _refreshing = false;
 
-  static const _diskCacheKey = 'courses_cache_v2';
+  /// v3：课程数据带 cover/notOpen 字段（v2 旧缓存没有，会让封面回退文字）。
+  static const _diskCacheKey = 'courses_cache_v3';
 
   @override
   Future<List<Course>> build() async {
@@ -430,23 +431,59 @@ class FetchGate {
 
 final _courseDetailGate = FetchGate(3);
 
-/// 课程章节状态详情（键：`courseId|clazzId|cpi`）。
-/// keepAlive 缓存 + 卡片构建时预取；详情弹窗里可 invalidate 强刷。
-final courseDetailProvider =
-    FutureProvider.family<CourseDetail, String>((ref, key) async {
-  final parts = key.split('|');
-  await _courseDetailGate.acquire();
-  try {
-    final result = await ref.read(engineClientProvider).rpc('course.detail', {
-      'course_id': parts.isNotEmpty ? parts[0] : '',
-      'clazz_id': parts.length > 1 ? parts[1] : '',
-      'cpi': parts.length > 2 ? parts[2] : '',
-    });
-    return CourseDetail.fromJson((result as Map).cast<String, dynamic>());
-  } finally {
-    _courseDetailGate.release();
+/// 课程章节详情仓库：键为 `courseId|clazzId|cpi`。
+///
+/// 语义（修复“课程页无限读取”）：`ensure` 只在条目缺失时读一次，读完即止，
+/// 绝不自动重读；只有用户在详情弹窗点刷新（`refresh`）或整体刷新
+/// （`clearAll`）时才回源。卡片构建/滚动只会触发缺失条目的首次读取。
+class CourseDetailStore
+    extends Notifier<Map<String, AsyncValue<CourseDetail>>> {
+  final Set<String> _inFlight = {};
+
+  @override
+  Map<String, AsyncValue<CourseDetail>> build() => const {};
+
+  Future<void> ensure(String key, {bool force = false}) async {
+    final current = state[key];
+    if (!force && current != null && current.hasValue) return;
+    if (_inFlight.contains(key)) return;
+    _inFlight.add(key);
+    state = {
+      ...state,
+      key: const AsyncLoading<CourseDetail>(),
+    };
+    try {
+      await _courseDetailGate.acquire();
+      try {
+        final parts = key.split('|');
+        final result =
+            await ref.read(engineClientProvider).rpc('course.detail', {
+          'course_id': parts.isNotEmpty ? parts[0] : '',
+          'clazz_id': parts.length > 1 ? parts[1] : '',
+          'cpi': parts.length > 2 ? parts[2] : '',
+        });
+        final detail = CourseDetail.fromJson((result as Map).cast<String, dynamic>());
+        state = {...state, key: AsyncData(detail)};
+      } finally {
+        _courseDetailGate.release();
+      }
+    } catch (error, stack) {
+      state = {...state, key: AsyncError(error, stack)};
+    } finally {
+      _inFlight.remove(key);
+    }
   }
-});
+
+  Future<void> refresh(String key) => ensure(key, force: true);
+
+  void clearAll() {
+    _inFlight.clear();
+    state = const {};
+  }
+}
+
+final courseDetailStoreProvider = NotifierProvider<CourseDetailStore,
+    Map<String, AsyncValue<CourseDetail>>>(CourseDetailStore.new);
 
 /// 课程页筛选/排序状态（查询词、状态、排序），持久化到本地。
 class CourseFilterState {

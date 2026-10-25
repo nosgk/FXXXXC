@@ -35,6 +35,25 @@ class _FakeCoursesNotifier extends CoursesNotifier {
   Future<void> refresh() async {}
 }
 
+class _FakeDetailStore extends CourseDetailStore {
+  _FakeDetailStore(this.details);
+
+  final Map<String, CourseDetail> details;
+
+  @override
+  Map<String, AsyncValue<CourseDetail>> build() =>
+      {for (final entry in details.entries) entry.key: AsyncData(entry.value)};
+
+  @override
+  Future<void> ensure(String key, {bool force = false}) async {}
+
+  @override
+  Future<void> refresh(String key) async {}
+
+  @override
+  void clearAll() {}
+}
+
 class _FakeStatusNotifier extends StatusNotifier {
   _FakeStatusNotifier(this.status);
 
@@ -62,13 +81,15 @@ ProviderContainer _container({
   required List<Course> courses,
   StudyStatus? status,
 }) {
+  // 每门课程的详情键都预置同一份明细，卡片与详情弹窗直接有数据（读一次语义）。
+  final detailMap = {for (final course in courses) course.detailKey: _detail};
   return ProviderContainer(
     overrides: [
       coursesProvider.overrideWith(() => _FakeCoursesNotifier(courses)),
       statusProvider.overrideWith(() => _FakeStatusNotifier(
           status ?? const StudyStatus(state: 'idle'))),
-      courseDetailProvider.overrideWith(
-          (ref, key) => Future<CourseDetail>.value(_detail)),
+      courseDetailStoreProvider
+          .overrideWith(() => _FakeDetailStore(detailMap)),
     ],
   );
 }

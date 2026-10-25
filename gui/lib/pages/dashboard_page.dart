@@ -588,13 +588,13 @@ class _MetricsGrid extends StatelessWidget {
         icon: Icons.school_outlined,
       ),
       _MetricCard(
-        label: '题库命中率',
+        label: '答题命中率',
         value: hit == null ? '—' : '${(hit * 100).toStringAsFixed(0)}%',
         icon: Icons.fact_check_outlined,
         detail: status.tikuQueries > 0 ? '${status.tikuHits}/${status.tikuQueries} 题' : null,
       ),
       _MetricCard(
-        label: '题库覆盖率',
+        label: '答题覆盖率',
         value: status.coverRate == null ? '—' : '${status.coverRate!.toStringAsFixed(0)}%',
         icon: Icons.insights_outlined,
       ),
@@ -941,7 +941,7 @@ class _EmptyActivity extends StatelessWidget {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: const [
-                    _GuideStep(order: '1', text: '在「设置」填写账号与题库，保存后写入 config.ini'),
+                    _GuideStep(order: '1', text: '在「设置」填写账号与答题源，保存后写入 config.ini'),
                     _GuideStep(order: '2', text: '在「课程」页刷新并勾选要学习的课程'),
                     _GuideStep(order: '3', text: '回到这里点击「开始学习」，仪表盘实时显示进展'),
                     _GuideStep(order: '4', text: '手动答题会弹出答题窗口，异常可到「日志」页排查'),
@@ -1007,5 +1007,6 @@ IconData kindIcon(String kind) => switch (kind) {
       'work' => Icons.quiz_outlined,
       'read' => Icons.menu_book_outlined,
       'live' => Icons.live_tv_outlined,
+      'learn' => Icons.repeat_outlined,
       _ => Icons.circle_outlined,
     };

@@ -15,6 +15,7 @@ class _Field {
     this.boolField = false,
     this.helper,
     this.numeric,
+    this.multiline = false,
   });
 
   final String key;
@@ -24,6 +25,8 @@ class _Field {
   final bool boolField;
   final String? helper;
   final _NumericRange? numeric;
+  /// 多行文本域（用于粘贴 JSON 配置）。
+  final bool multiline;
 }
 
 class _NumericRange {
@@ -43,7 +46,7 @@ class _Section {
   final String? intro;
 }
 
-/// 题库源元信息：显示名 + 一句话说明（小白选型用）。
+/// 答题源元信息：显示名 + 一句话说明（小白选型用）。
 class _ProviderMeta {
   const _ProviderMeta(this.display, this.desc);
   final String display;
@@ -51,6 +54,7 @@ class _ProviderMeta {
 }
 
 const _bankProviders = <String, _ProviderMeta>{
+  'TikuOcs': _ProviderMeta('OCS 兼容答题源', '粘贴 ocsjs 题库配置 JSON 即用，鉴权内嵌免单独配置'),
   'TikuYanxi': _ProviderMeta('言溪题库', '公共在线题库，需 token，按次计费查询'),
   'TikuGo': _ProviderMeta('GO题（网课小工具）', '公共在线题库，需 Authorization 鉴权码'),
   'TikuLike': _ProviderMeta('LIKE 知识库', '支持图片题目识别的在线题库'),
@@ -60,8 +64,16 @@ const _bankProviders = <String, _ProviderMeta>{
   'TikuManual': _ProviderMeta('手动作答', '遇到题目弹出窗口人工作答，最稳妥但需人值守'),
 };
 
-/// 每种题库源只显示自己的配置项（选择 A 源就只显示 A 源的设置）。
+/// 每种答题源只显示自己的配置项（选择 A 源就只显示 A 源的设置）。
 const _bankProviderFields = <String, List<_Field>>{
+  'TikuOcs': [
+    _Field('ocs_wrappers', 'OCS 题库配置 JSON', multiline: true,
+        helper: '粘贴 ocsjs「题库配置」的 JSON（[{name,url,data,...}]）；'
+            '鉴权通常已内嵌在配置里，无需额外 token。'
+            '其中的 handler(JS) 不会被执行，按 answer_path 或智能提取解析'),
+    _Field('ocs_answer_path', '答案提取路径（可选）',
+        helper: '点路径如 data.answer；留空使用智能提取'),
+  ],
   'TikuYanxi': [
     _Field('tokens', '题库 Token',
         helper: '在 tk.enncy.cn 个人中心获取，多个 token 用英文逗号分隔，可自动轮换'),
@@ -120,7 +132,7 @@ const _bankBaseFields = <_Field>[
   _Field('priority', '回退顺序（数值小的先查询）',
       numeric: _NumericRange(0, 999, isInt: true)),
   _Field('name', '实例名称', helper: '仅用于在本页展示，方便区分多个实例'),
-  _Field('provider', '题库源类型'),
+  _Field('provider', '答题源类型'),
 ];
 
 const _bankProviderOptions = ['TikuYanxi', 'TikuGo', 'TikuLike', 'TikuAdapter', 'AI', 'SiliconFlow', 'TikuManual'];
@@ -170,8 +182,8 @@ const _fixedSections = [
   ], intro: '控制学习行为：速度、并发、重试与重做策略。保守设置更安全。'),
 ];
 
-/// 全局题库设置：作用于所有题库源实例的公共参数。
-const _tikuGlobalSection = _Section('题库全局设置', 'tiku', [
+/// 全局答题源设置：作用于所有答题源实例的公共参数。
+const _tikuGlobalSection = _Section('答题全局设置', 'tiku', [
   _Field('submit', '达到覆盖率后自动提交', boolField: true,
       helper: '关闭=只保存答案不提交（最安全）；开启=覆盖率达标后交卷'),
   _Field('cover_rate', '最低题库覆盖率', numeric: _NumericRange(0.0, 1.0),
@@ -186,8 +198,8 @@ const _tikuGlobalSection = _Section('题库全局设置', 'tiku', [
       helper: '仅自签名/内网环境使用，默认关闭'),
   _Field('provider', '兼容模式 provider（可逗号分隔多个）',
       options: _bankProviderOptions,
-      helper: '旧版单配置模式；配置了上方题库源实例后此项被忽略'),
-], intro: '这些参数对所有题库源生效：提交策略、覆盖率门槛与判断题词表。');
+      helper: '旧版单配置模式；配置了上方答题源实例后此项被忽略'),
+], intro: '这些参数对所有答题源生效：提交策略、覆盖率门槛与判断题词表。');
 
 class _BankMeta {
   _BankMeta(this.sectionId, {this.localOnly = false});
@@ -212,6 +224,8 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
   final _banks = <String, _BankMeta>{};
   final _bankOrder = <String>[];
   final _removedBanks = <String>{};
+  /// 收起/展开的答题源卡片（未展开即收起态：只显示摘要行）。
+  final _expandedBanks = <String>{};
   bool _saving = false;
   bool _dark = false;
 
@@ -326,6 +340,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     _banks.remove(sectionId);
     _bankOrder.remove(sectionId);
     _removedBanks.remove(sectionId);
+    _expandedBanks.remove(sectionId);
     final doomed = _controllers.keys
         .where((key) => key.startsWith('$sectionId.'))
         .toList();
@@ -350,9 +365,10 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     final id = _newBankId();
     _banks[id] = _BankMeta(id, localOnly: true);
     _bankOrder.add(id);
+    _expandedBanks.add(id);
     _setBankValue(id, 'enabled', 'true');
     _setBankValue(id, 'priority', '${_bankOrder.length - 1}');
-    _setBankValue(id, 'name', '题库源 ${_bankOrder.length}');
+    _setBankValue(id, 'name', '答题源 ${_bankOrder.length}');
     _setBankValue(id, 'provider', 'TikuYanxi');
     setState(() {});
   }
@@ -365,17 +381,30 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     _dirty.add(key);
   }
 
-  void _moveBank(int index, int delta) {
-    final target = index + delta;
-    if (target < 0 || target >= _bankOrder.length) return;
-    final id = _bankOrder.removeAt(index);
-    _bankOrder.insert(target, id);
-    // 顺序即优先级：重排后把 priority 0..n-1 写回并标记待保存。
+  /// 拖拽排序后重写 priority 0..n-1（顺序即回退梯度）。
+  /// [preAdjusted] 为 true 时 newIndex 已按“移除后插入”语义调整过
+  /// （onReorderItem 回调的约定），不再做 -1 修正。
+  void _reorderBanks(int oldIndex, int newIndex, {bool preAdjusted = false}) {
+    if (!preAdjusted && newIndex > oldIndex) newIndex -= 1;
+    if (oldIndex < 0 ||
+        oldIndex >= _bankOrder.length ||
+        newIndex < 0 ||
+        newIndex >= _bankOrder.length) {
+      return;
+    }
+    final id = _bankOrder.removeAt(oldIndex);
+    _bankOrder.insert(newIndex, id);
     for (var i = 0; i < _bankOrder.length; i++) {
       _setBankValue(_bankOrder[i], 'priority', '$i');
     }
     setState(() {});
   }
+
+  /// 仅供测试：绕过手势竞技场直接触发拖拽排序回调
+  /// （ReorderableDragStartListener 在嵌套可滚动容器的组件测试里不可靠）。
+  @visibleForTesting
+  void testReorderBanks(int oldIndex, int newIndex) =>
+      _reorderBanks(oldIndex, newIndex, preAdjusted: true);
 
   void _deleteBank(String sectionId) {
     final meta = _banks[sectionId];
@@ -468,7 +497,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       await ref.read(configProvider.future);
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('已保存${removed.isEmpty ? '' : '（含 ${removed.length} 个已删除的题库源）'}')),
+          SnackBar(content: Text('已保存${removed.isEmpty ? '' : '（含 ${removed.length} 个已删除的答题源）'}')),
         );
       }
     } on EngineException catch (error) {
@@ -591,7 +620,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
               OutlinedButton.icon(
                 onPressed: _saving ? null : () => _test('tiku.test'),
                 icon: const Icon(Icons.quiz_outlined),
-                label: const Text('测试题库'),
+                label: const Text('测试答题源'),
               ),
               const SizedBox(width: 8),
               OutlinedButton.icon(
@@ -609,7 +638,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     );
   }
 
-  // ------------------------------------------------------- 题库源工作台 UI
+  // ------------------------------------------------------- 答题源工作台 UI
 
   Widget _buildBanksWorkbench(BuildContext context) {
     final theme = Theme.of(context);
@@ -621,19 +650,19 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
           children: [
             Row(
               children: [
-                Text('题库源（梯度回退）', style: theme.textTheme.titleMedium),
+                Text('答题源（梯度回退）', style: theme.textTheme.titleMedium),
                 const Spacer(),
                 FilledButton.tonalIcon(
                   onPressed: _addBank,
                   icon: const Icon(Icons.add, size: 18),
-                  label: const Text('添加题库源'),
+                  label: const Text('添加答题源'),
                 ),
               ],
             ),
             const SizedBox(height: 8),
             Text(
               '从上到下依次查询：第 1 个源没查到的题自动问第 2 个，以此类推。'
-              '每个源单独配置 token / 模型 / 接口，互不影响，可同时启用多个不同源来组合覆盖率。',
+              '每个源单独配置 token / 模型 / 接口，互不影响；拖动 ⠿ 手柄即可调整梯度顺序。',
               style: theme.textTheme.bodySmall
                   ?.copyWith(color: theme.colorScheme.outline, height: 1.5),
             ),
@@ -642,15 +671,30 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
               Padding(
                 padding: const EdgeInsets.symmetric(vertical: 12),
                 child: Text(
-                  '还没有题库源。点击「添加题库源」创建第一个，'
+                  '还没有答题源。点击「添加答题源」创建第一个，'
                   '例如先加「言溪题库」，再加「AI 大模型」作为兜底。',
                   style: theme.textTheme.bodySmall,
                 ),
+              )
+            else
+              ReorderableListView.builder(
+                shrinkWrap: true,
+                physics: const NeverScrollableScrollPhysics(),
+                buildDefaultDragHandles: false,
+                padding: EdgeInsets.zero,
+                itemCount: _bankOrder.length,
+                onReorderItem: (oldIndex, newIndex) =>
+                    _reorderBanks(oldIndex, newIndex, preAdjusted: true),
+                proxyDecorator: (child, index, animation) => ScaleTransition(
+                  scale: Tween<double>(begin: 1, end: 1.02).animate(animation),
+                  child: child,
+                ),
+                itemBuilder: (context, index) => Container(
+                  key: ValueKey(_bankOrder[index]),
+                  margin: const EdgeInsets.only(bottom: 12),
+                  child: _buildBankCard(context, index),
+                ),
               ),
-            for (var index = 0; index < _bankOrder.length; index++) ...[
-              if (index > 0) const Divider(height: 24),
-              _buildBankCard(context, index),
-            ],
           ],
         ),
       ),
@@ -668,9 +712,10 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
     final name = _text(_keyOf(sectionId, 'name')).trim();
     final providerFields = _providerFieldsFor(provider);
     final theme = Theme.of(context);
+    final expanded = _expandedBanks.contains(sectionId);
 
     return Container(
-      padding: const EdgeInsets.all(16),
+      padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
         color: theme.colorScheme.surfaceContainerLow.withValues(alpha: 0.6),
         borderRadius: BorderRadius.circular(14),
@@ -686,112 +731,163 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-          Row(
-            children: [
-              // 序号即回退优先级：1 = 最先查询
-              Container(
-                width: 26,
-                height: 26,
-                alignment: Alignment.center,
-                decoration: BoxDecoration(
-                  color: enabled
-                      ? theme.colorScheme.primaryContainer
-                      : theme.colorScheme.surfaceContainerHighest,
-                  shape: BoxShape.circle,
-                ),
-                child: Text(
-                  '${index + 1}',
-                  style: TextStyle(
-                    fontSize: 12,
-                    fontWeight: FontWeight.w700,
+            Row(
+              children: [
+                // 序号即回退优先级：1 = 最先查询
+                Container(
+                  width: 26,
+                  height: 26,
+                  alignment: Alignment.center,
+                  decoration: BoxDecoration(
                     color: enabled
-                        ? theme.colorScheme.onPrimaryContainer
-                        : theme.colorScheme.outline,
+                        ? theme.colorScheme.primaryContainer
+                        : theme.colorScheme.surfaceContainerHighest,
+                    shape: BoxShape.circle,
+                  ),
+                  child: Text(
+                    '${index + 1}',
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w700,
+                      color: enabled
+                          ? theme.colorScheme.onPrimaryContainer
+                          : theme.colorScheme.outline,
+                    ),
                   ),
                 ),
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      name.isEmpty ? sectionId : name,
-                      style: theme.textTheme.titleSmall,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                    if (meta != null)
-                      Text(meta.desc,
+                const SizedBox(width: 10),
+                Expanded(
+                  child: InkWell(
+                    onTap: () => setState(() {
+                      if (expanded) {
+                        _expandedBanks.remove(sectionId);
+                      } else {
+                        _expandedBanks.add(sectionId);
+                      }
+                    }),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          name.isEmpty ? sectionId : name,
+                          style: theme.textTheme.titleSmall,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        Text(
+                          meta == null
+                              ? (provider.isEmpty ? '未选择答题源类型' : provider)
+                              : (expanded ? meta.desc : '${meta.display} · 点按展开配置'),
                           style: theme.textTheme.bodySmall
-                              ?.copyWith(color: theme.colorScheme.outline)),
-                  ],
+                              ?.copyWith(color: theme.colorScheme.outline),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ],
+                    ),
+                  ),
                 ),
-              ),
-              IconButton(
-                tooltip: '上移（更早被查询）',
-                onPressed: index > 0 ? () => _moveBank(index, -1) : null,
-                icon: const Icon(Icons.arrow_upward, size: 18),
-              ),
-              IconButton(
-                tooltip: '下移（更晚被查询）',
-                onPressed: index < _bankOrder.length - 1
-                    ? () => _moveBank(index, 1)
-                    : null,
-                icon: const Icon(Icons.arrow_downward, size: 18),
-              ),
-              Switch(
-                value: enabled,
-                onChanged: (next) =>
-                    _markDirty(_keyOf(sectionId, 'enabled'), '$next'),
-              ),
-              IconButton(
-                tooltip: '删除该题库源',
-                onPressed: () => _deleteBank(sectionId),
-                icon: Icon(Icons.delete_outline,
-                    size: 18, color: theme.colorScheme.error),
-              ),
-            ],
-          ),
-          const SizedBox(height: 8),
-          DropdownButtonFormField<String>(
-            initialValue: _bankProviders.containsKey(provider) ? provider : null,
-            decoration: const InputDecoration(
-              labelText: '题库源类型',
-              helperText: '切换类型后仅显示该类型的配置项',
+                // 拖拽手柄：按住即可调整梯度顺序
+                ReorderableDragStartListener(
+                  index: index,
+                  child: Padding(
+                    padding: const EdgeInsets.all(8),
+                    child: Icon(Icons.drag_handle,
+                        size: 20, color: theme.colorScheme.outline),
+                  ),
+                ),
+                Switch(
+                  value: enabled,
+                  onChanged: (next) =>
+                      _markDirty(_keyOf(sectionId, 'enabled'), '$next'),
+                ),
+                IconButton(
+                  tooltip: expanded ? '收起配置' : '展开配置',
+                  onPressed: () => setState(() {
+                    if (expanded) {
+                      _expandedBanks.remove(sectionId);
+                    } else {
+                      _expandedBanks.add(sectionId);
+                    }
+                  }),
+                  icon: AnimatedRotation(
+                    turns: expanded ? 0.5 : 0,
+                    duration: const Duration(milliseconds: 180),
+                    child: const Icon(Icons.expand_more, size: 20),
+                  ),
+                ),
+                IconButton(
+                  tooltip: '删除该答题源',
+                  onPressed: () => _deleteBank(sectionId),
+                  icon: Icon(Icons.delete_outline,
+                      size: 18, color: theme.colorScheme.error),
+                ),
+              ],
             ),
-            items: [
-              for (final entry in _bankProviders.entries)
-                DropdownMenuItem(
-                  value: entry.key,
-                  child: Text('${entry.value.display}（${entry.key}）'),
-                ),
-            ],
-            onChanged: (value) {
-              if (value == null || value == provider) return;
-              _markDirty(_keyOf(sectionId, 'provider'), value);
-            },
-          ),
-          const SizedBox(height: 4),
-          if (!enabled)
-            Padding(
-              padding: const EdgeInsets.symmetric(vertical: 6),
-              child: Text('已停用：该源不参与查询，配置保留。',
-                  style: theme.textTheme.bodySmall
-                      ?.copyWith(color: theme.colorScheme.outline)),
-            )
-          else ...[
-            for (final field in providerFields)
-              _buildField(context, sectionId, field),
-            if (providerFields.isEmpty)
-              Padding(
-                padding: const EdgeInsets.symmetric(vertical: 6),
-                child: Text('该类型暂无额外配置。',
-                    style: theme.textTheme.bodySmall
-                        ?.copyWith(color: theme.colorScheme.outline)),
-              ),
+            // AnimatedSwitcher 而非 AnimatedCrossFade：收起态不常驻挂载配置区，
+            // 避免隐藏的 TextField 仍留在树里（也省掉大段 JSON 配置的隐藏构建开销）。
+            AnimatedSwitcher(
+              duration: const Duration(milliseconds: 180),
+              switchInCurve: Curves.easeOutCubic,
+              transitionBuilder: (child, animation) =>
+                  SizeTransition(sizeFactor: animation, child: child),
+              child: expanded
+                  ? KeyedSubtree(
+                      key: ValueKey('expanded-$sectionId'),
+                      child: Padding(
+                        padding: const EdgeInsets.only(top: 10),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            if (!enabled)
+                              Padding(
+                                padding: const EdgeInsets.only(bottom: 6),
+                                child: Text('已停用：该源不参与查询，配置保留。',
+                                    style: theme.textTheme.bodySmall
+                                        ?.copyWith(color: theme.colorScheme.outline)),
+                              ),
+                            DropdownButtonFormField<String>(
+                              initialValue:
+                                  _bankProviders.containsKey(provider) ? provider : null,
+                              decoration: const InputDecoration(
+                                labelText: '答题源类型',
+                                helperText: '切换类型后仅显示该类型的配置项',
+                              ),
+                              items: [
+                                for (final entry in _bankProviders.entries)
+                                  DropdownMenuItem(
+                                    value: entry.key,
+                                    child: Text('${entry.value.display}（${entry.key}）'),
+                                  ),
+                              ],
+                              onChanged: (value) {
+                                if (value == null || value == provider) return;
+                                _markDirty(_keyOf(sectionId, 'provider'), value);
+                              },
+                            ),
+                            const SizedBox(height: 4),
+                            _buildField(
+                              context,
+                              sectionId,
+                              const _Field('name', '实例名称',
+                                  helper: '仅用于在本页展示，方便区分多个实例'),
+                            ),
+                            for (final field in providerFields)
+                              _buildField(context, sectionId, field),
+                            if (providerFields.isEmpty)
+                              Padding(
+                                padding: const EdgeInsets.symmetric(vertical: 6),
+                                child: Text('该类型暂无额外配置。',
+                                    style: theme.textTheme.bodySmall
+                                        ?.copyWith(color: theme.colorScheme.outline)),
+                              ),
+                          ],
+                        ),
+                      ),
+                    )
+                  : const SizedBox(width: double.infinity, key: ValueKey('collapsed')),
+            ),
           ],
-        ],
         ),
       ),
     );
@@ -884,11 +980,16 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       child: TextField(
         controller: controller,
         obscureText: field.obscure,
+        minLines: field.multiline ? 5 : 1,
+        maxLines: field.multiline ? 10 : 1,
+        keyboardType:
+            field.multiline ? TextInputType.multiline : TextInputType.text,
         onChanged: (value) => _markDirty(key, value),
         decoration: InputDecoration(
           labelText: field.label,
           helperText: field.helper,
-          helperMaxLines: 3,
+          helperMaxLines: 4,
+          alignLabelWithHint: field.multiline,
         ),
       ),
     );
@@ -974,8 +1075,8 @@ class _IntroCard extends StatelessWidget {
             ),
             const SizedBox(height: 4),
             Text(
-              '按顺序配置：① 账号 → ② 学习策略 → ③ 至少一个题库源 → ④ 通知（可选）。'
-              '每项旁边都有说明；改完点底部「保存配置」，再用「测试题库」验证是否可用。'
+              '按顺序配置：① 账号 → ② 学习策略 → ③ 至少一个答题源 → ④ 通知（可选）。'
+              '每项旁边都有说明；改完点底部「保存配置」，再用「测试答题源」验证是否可用。'
               '配置保存在引擎的 config.ini，与日志、cookies 同目录。',
               style: theme.textTheme.bodySmall
                   ?.copyWith(color: theme.colorScheme.outline, height: 1.6),

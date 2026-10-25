@@ -114,7 +114,7 @@ void main() {
     expect(_controllerOf(tester, '并发章节数').text, '6');
   });
 
-  testWidgets('bank workbench renders per-provider fields and reorder writes priorities',
+  testWidgets('bank workbench: expand shows provider fields, drag writes priorities',
       (tester) async {
     final store = <String, dynamic>{
       'tiku': {'submit': 'false'},
@@ -129,15 +129,22 @@ void main() {
     };
     final container = await _pump(tester, store);
 
-    // 每个源只显示自己的配置项：AI 实例出现 endpoint 字段，言溪实例出现 tokens。
+    // 收起态：只显示摘要；两个实例都在
     expect(find.text('言溪'), findsOneWidget);
     expect(find.text('AI兜底'), findsOneWidget);
+    expect(find.text('接口地址 endpoint'), findsNothing);
+
+    // 展开第二个源（AI兜底）→ 显示 AI 专属字段
+    await tester.tap(find.byTooltip('展开配置').last);
+    await tester.pumpAndSettle();
     expect(find.text('接口地址 endpoint'), findsOneWidget);
     expect(find.text('额外请求参数 extra_body'), findsOneWidget);
 
-    // 把第二个源（AI兜底）上移到第一位 → priority 0..n-1 重写。
-    await tester.tap(find.byTooltip('上移（更早被查询）').last);
-    await tester.pump();
+    // 拖拽排序：经测试入口触发 onReorderItem 同款回调（手势接线由框架保证）
+    final pageState = tester.state<State>(find.byType(SettingsPage));
+    (pageState as dynamic).testReorderBanks(1, 0);
+    await tester.pumpAndSettle();
+    expect(find.text('1'), findsWidgets); // 序号圆标仍在
 
     await tester.tap(find.widgetWithText(FilledButton, '保存配置（2 项）'));
     await tester.pumpAndSettle();

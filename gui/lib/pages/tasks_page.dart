@@ -79,7 +79,7 @@ class TasksPage extends ConsumerWidget {
                     runSpacing: 4,
                     children: [
                       if (status.coverRate != null)
-                        Text('题库覆盖率 ${status.coverRate!.toStringAsFixed(0)}%',
+                        Text('答题覆盖率 ${status.coverRate!.toStringAsFixed(0)}%',
                             style: Theme.of(context).textTheme.bodySmall),
                       if (status.lastScore != null)
                         Text('最近成绩 ${status.lastScore!.toStringAsFixed(0)} 分',
