@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from re import sub
 from typing import Optional
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import quote, urljoin, urlparse, urlunparse
 
 import requests
 from urllib3 import disable_warnings, exceptions
@@ -2312,6 +2312,220 @@ class TikuManual(Tiku):
         return has_error, temp_answers
 
 
+class TikuOcs(Tiku):
+    """OCS 兼容答题源：执行 ocsjs（AnswererWrapper）题库配置。
+
+    参考 ocsjs 的题库配置体系（docs.ocsjs.com/docs/other/api#AnswererWrapper），
+    把“粘贴一段题库配置 JSON 即可用”的免配置体验带过来 —— 配置里通常已内嵌
+    鉴权（URL token 或 headers），无需再单独申请 key。
+
+    配置键（写在题库实例段）：
+      ocs_wrappers    ocsjs 题库配置 JSON（数组或单个对象）。兼容字段：
+                      name / url / homepage / data / method / contentType /
+                      headers；data 与 url 支持 ${title} ${options} ${type} 占位符。
+                      另支持声明式 ``answer_path``（点路径，如 data.answer）指定
+                      答案提取位置。
+      ocs_answer_path 可选，全局覆盖所有 wrapper 的答案提取路径。
+
+    说明：ocsjs 的 ``handler`` 是 JS 函数串，Python 侧不执行（也不应执行外来
+    代码）；缺少 answer_path 时走内置智能提取，覆盖公益题库常见返回形态
+    （{code:1,data:{answer|answers}} / {answer:...} / 数组 / 纯文本）。
+    多答案按 ocsjs 约定以 ``#`` 分隔返回。
+    """
+
+    # 智能提取时依次尝试的点路径
+    _DEFAULT_ANSWER_PATHS = (
+        'data.answer', 'answer', 'data.answers', 'answers',
+        'Answer', 'data.Answer', 'result',
+    )
+
+    def __init__(self, config_path: Optional[str] = None) -> None:
+        super().__init__(config_path)
+        self.name = 'OCS 兼容答题源'
+        self._wrappers: list[dict] = []
+
+    # ------------------------------------------------------------ 配置解析
+
+    def _init_tiku(self):
+        raw = self._conf.get('ocs_wrappers', '') or ''
+        self._wrappers = self._parse_wrappers(raw)
+        self._global_answer_path = str(self._conf.get('ocs_answer_path', '') or '').strip()
+        if not self._wrappers:
+            raise ValueError(
+                'OCS 兼容答题源未配置 ocs_wrappers：请粘贴 ocsjs 的题库配置 JSON'
+                '（[{name,url,data,method,...}]）'
+            )
+
+    @staticmethod
+    def _parse_wrappers(raw: str) -> list[dict]:
+        text = str(raw).strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f'ocs_wrappers 不是合法 JSON: {exc}') from exc
+        if isinstance(parsed, dict):
+            parsed = [parsed]
+        if not isinstance(parsed, list):
+            raise ValueError('ocs_wrappers 必须是题库配置数组或单个对象')
+        wrappers = []
+        for index, item in enumerate(parsed):
+            if not isinstance(item, dict):
+                logger.warning('OCS 题库配置第 {} 项不是对象，已跳过', index + 1)
+                continue
+            if not str(item.get('url', '') or '').strip():
+                logger.warning('OCS 题库配置第 {} 项缺少 url，已跳过', index + 1)
+                continue
+            if item.get('handler'):
+                logger.warning(
+                    'OCS 题库配置「{}」携带 handler(JS)，Python 侧不执行外来代码；'
+                    '将按智能提取/answer_path 解析响应',
+                    item.get('name', f'#{index + 1}'),
+                )
+            wrappers.append(item)
+        return wrappers
+
+    # ------------------------------------------------------------ 请求执行
+
+    @staticmethod
+    def _resolve_template(text: str, env: dict, quote_value: bool = False) -> str:
+        def _sub(match):
+            value = str(env.get(match.group(1), ''))
+            return quote_value and value and quote(value, safe='') or value
+
+        return re.sub(r'\$\{(\w+)\}', _sub, str(text))
+
+    def _request_wrapper(self, wrapper: dict, q_info: dict):
+        env = {
+            'title': q_info.get('title', ''),
+            'options': options_text(q_info.get('options')),
+            'type': q_info.get('type', 'unknown'),
+        }
+        url = self._resolve_template(wrapper['url'], env, quote_value=True)
+        method = str(wrapper.get('method', 'get') or 'get').lower()
+        headers = dict(wrapper.get('headers') or {})
+        content_type = str(wrapper.get('contentType', 'json') or 'json').lower()
+
+        data = wrapper.get('data') or {}
+        if isinstance(data, dict):
+            data = {key: self._resolve_template(value, env) for key, value in data.items()}
+        elif isinstance(data, str):
+            data = self._resolve_template(data, env)
+
+        last_error: Optional[Exception] = None
+        for attempt in (1, 2):
+            try:
+                if method == 'post':
+                    if content_type == 'json':
+                        return requests.post(
+                            url, json=data, headers=headers,
+                            verify=self._tls_verify(), timeout=15,
+                        )
+                    return requests.post(
+                        url, data=data, headers=headers,
+                        verify=self._tls_verify(), timeout=15,
+                    )
+                return requests.get(
+                    url, params=data if isinstance(data, dict) else None,
+                    headers=headers, verify=self._tls_verify(), timeout=15,
+                )
+            except requests.RequestException as exc:
+                last_error = exc
+                logger.warning('{}「{}」请求异常 ({}/2): {}',
+                               self.name, wrapper.get('name', ''), attempt, exc)
+                time.sleep(0.5 * attempt)
+        if last_error is not None:
+            raise last_error
+        return None
+
+    # ------------------------------------------------------------ 响应解析
+
+    def _extract_answer(self, payload, wrapper: dict) -> Optional[str]:
+        answer_path = self._global_answer_path or str(wrapper.get('answer_path', '') or '').strip()
+        if answer_path:
+            value = payload
+            for part in answer_path.split('.'):
+                if isinstance(value, dict) and part in value:
+                    value = value[part]
+                else:
+                    value = None
+                    break
+            normalized = self._normalize_answer_value(value)
+            if normalized:
+                return normalized
+            logger.info('{}「{}」answer_path={} 未命中，回退智能提取',
+                        self.name, wrapper.get('name', ''), answer_path)
+        if isinstance(payload, dict):
+            code = payload.get('code', payload.get('status', 1))
+            if code in (0, False, '0', 'false'):
+                message = payload.get('msg') or payload.get('message') or ''
+                logger.info('{}「{}」响应 code=0: {}', self.name, wrapper.get('name', ''), message)
+                return None
+        for path in self._DEFAULT_ANSWER_PATHS:
+            value = payload
+            for part in path.split('.'):
+                if isinstance(value, dict) and part in value:
+                    value = value[part]
+                else:
+                    value = None
+                    break
+            normalized = self._normalize_answer_value(value)
+            if normalized:
+                return normalized
+        if isinstance(payload, dict):
+            data = payload.get('data')
+            if isinstance(data, str) and data.strip():
+                return data.strip()
+        if isinstance(payload, (str, list)):
+            return self._normalize_answer_value(payload)
+        return None
+
+    @staticmethod
+    def _normalize_answer_value(value) -> Optional[str]:
+        """把题库返回的答案值归一化为字符串；多答案以 # 分隔。"""
+        if value is None:
+            return None
+        if isinstance(value, list):
+            parts = []
+            for item in value:
+                if isinstance(item, dict):
+                    for key in ('answer', 'answers', 'value', 'content', 'text'):
+                        if item.get(key):
+                            parts.append(str(item[key]).strip())
+                            break
+                elif item is not None and str(item).strip():
+                    parts.append(str(item).strip())
+            joined = '#'.join(part for part in parts if part)
+            return joined or None
+        text = str(value).strip()
+        return text or None
+
+    def _query(self, q_info: dict):
+        for wrapper in self._wrappers:
+            name = wrapper.get('name', wrapper.get('url', ''))
+            try:
+                res = self._request_wrapper(wrapper, q_info)
+            except requests.RequestException as exc:
+                logger.error('{}「{}」请求失败: {}', self.name, name, exc)
+                continue
+            if res is None or res.status_code != 200:
+                logger.error('{}「{}」查询失败: 状态码 {}',
+                             self.name, name, getattr(res, 'status_code', '?'))
+                continue
+            try:
+                content_type = str(wrapper.get('contentType', 'json') or 'json').lower()
+                payload = res.json() if content_type == 'json' else res.text
+            except ValueError:
+                logger.error('{}「{}」返回非 JSON 内容: {}', self.name, name, res.text[:120])
+                continue
+            answer = self._extract_answer(payload, wrapper)
+            if answer:
+                return answer
+            logger.info('{}「{}」未命中题目', self.name, name)
+        return None
+
+
 class DummyTiku(Tiku):
     def __init__(self, config_path: Optional[str] = None) -> None:
         """初始化空题库."""
@@ -2325,6 +2539,7 @@ class DummyTiku(Tiku):
 
 PROVIDER_REGISTRY = {
     'TikuYanxi': TikuYanxi,
+    'TikuOcs': TikuOcs,
     'TikuGo': TikuGo,
     'TikuLike': TikuLike,
     'TikuAdapter': TikuAdapter,

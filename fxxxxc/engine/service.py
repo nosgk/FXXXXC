@@ -729,6 +729,12 @@ class EngineService:
 
             failed = len(processor.failed_tasks)
             elapsed = max(0, int(time.time() - self._run_started_at))
+
+            # 学习次数阶段属于本轮任务的一部分：必须在整轮结束事件之前完成，
+            # 否则 GUI 会先收到“本轮结束”而状态仍是 running，表现为不同步。
+            if config.get("add_learning_count"):
+                self._increase_learning_count(chaoxing, selected, config)
+
             detail = f"完成，失败章节 {failed}，用时 {elapsed // 60}分{elapsed % 60}秒" if elapsed else f"完成，失败章节 {failed}"
             self._set_state("idle", detail)
             self.bus.emit(
@@ -744,9 +750,6 @@ class EngineService:
                 "study.task",
                 {"kind": "run", "phase": "finished", "run_id": run_id, "total": len(tasks), "failed": failed, "elapsed": elapsed},
             )
-
-            if config.get("add_learning_count"):
-                self._increase_learning_count(chaoxing, selected, config)
         except RpcError as exc:
             self._set_state("error", exc.message)
             self.bus.emit("study.progress", {"run_id": run_id, "phase": "error", "message": exc.message})
@@ -771,15 +774,21 @@ class EngineService:
     def _increase_learning_count(self, chaoxing: Chaoxing, courses: list[dict], config: dict) -> None:
         from api.process import increase_learning_count_for_course
 
-        self._set_state("running", "增加章节学习次数")
         for course in courses:
             if chaoxing.should_stop():
                 break
+            self._set_state("running", f"增加章节学习次数：{course.get('title', '')}")
             increase_learning_count_for_course(chaoxing, course, config)
 
     def study_pause(self) -> dict:
         processor = self._processor
         if processor is None:
+            worker = self._worker
+            if worker is not None and worker.is_alive():
+                raise RpcError(
+                    STUDY_NOT_RUNNING,
+                    "当前阶段（如增加章节学习次数）不支持暂停，可使用「停止」结束",
+                )
             raise RpcError(STUDY_NOT_RUNNING, "没有正在运行的学习任务")
         processor.pause()
         self._set_state("paused", "已暂停")
@@ -796,6 +805,14 @@ class EngineService:
     def study_stop(self) -> dict:
         processor = self._processor
         if processor is None:
+            # 学习次数等无 processor 的阶段：通过取消钩子停止工作线程，
+            # 而不是直接返回（旧实现会误报“没有正在运行的学习任务”）。
+            worker = self._worker
+            chaoxing = self._chaoxing
+            if worker is not None and worker.is_alive() and chaoxing is not None:
+                self._set_state("stopping", "正在停止")
+                chaoxing.cancel()
+                return {"state": "stopping"}
             return {"state": self.state()}
         self._set_state("stopping", "正在停止")
         processor.stop()

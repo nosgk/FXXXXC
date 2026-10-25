@@ -1595,18 +1595,38 @@ class Chaoxing:
         except (TypeError, ValueError):
             interval = 30.0
         logger.info(f"开始增加章节学习次数, 目标总次数: {target_count}, 章节数: {len(points)}")
+        self.emit_progress(
+            {
+                "kind": "learn",
+                "phase": "start",
+                "course": course.get("title", ""),
+                "target": target_count,
+            }
+        )
         if not points:
             logger.warning("章节列表为空, 跳过章节学习次数增加")
+            self.emit_progress(
+                {"kind": "learn", "phase": "error", "course": course.get("title", ""),
+                 "message": "课程没有章节, 无法增加学习次数"}
+            )
             return StudyResult.SUCCESS
         while total < target_count:
             if self.should_stop():
                 logger.info("收到取消请求, 停止章节学习次数增加")
+                self.emit_progress(
+                    {"kind": "learn", "phase": "error", "course": course.get("title", ""),
+                     "count": total, "target": target_count, "message": "已停止"}
+                )
                 return StudyResult.ERROR
             for point in points:
                 if total >= target_count:
                     break
                 if self.should_stop():
                     logger.info("收到取消请求, 停止章节学习次数增加")
+                    self.emit_progress(
+                        {"kind": "learn", "phase": "error", "course": course.get("title", ""),
+                         "count": total, "target": target_count, "message": "已停止"}
+                    )
                     return StudyResult.ERROR
                 self.rate_limiter.limit_rate(random_time=True, random_min=0, random_max=0.2)
                 html_text = self._access_chapter_for_count(course, point)
@@ -1616,6 +1636,11 @@ class Chaoxing:
                     if consecutive_failures >= max_consecutive_failures:
                         logger.error(
                             f"章节学习次数增加连续失败 {consecutive_failures} 次, 终止任务"
+                        )
+                        self.emit_progress(
+                            {"kind": "learn", "phase": "error", "course": course.get("title", ""),
+                             "count": total, "target": target_count,
+                             "message": f"连续失败 {consecutive_failures} 次, 已终止"}
                         )
                         return StudyResult.ERROR
                     continue
@@ -1636,5 +1661,24 @@ class Chaoxing:
 
                 total += 1
                 logger.info(f"章节学习次数进度: {total}/{target_count}")
+                self.emit_progress(
+                    {
+                        "kind": "learn",
+                        "phase": "progress",
+                        "course": course.get("title", ""),
+                        "name": point.get("title", ""),
+                        "count": total,
+                        "target": target_count,
+                    }
+                )
         logger.info(f"章节学习次数增加完成, 共完成: {total} 次")
+        self.emit_progress(
+            {
+                "kind": "learn",
+                "phase": "done",
+                "course": course.get("title", ""),
+                "count": total,
+                "target": target_count,
+            }
+        )
         return StudyResult.SUCCESS
