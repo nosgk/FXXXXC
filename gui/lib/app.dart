@@ -189,14 +189,11 @@ class _AppShellState extends ConsumerState<AppShell> {
                         if (_visited.contains(i))
                           Offstage(
                             offstage: i != _index,
+                            // 不再包 _PageFadeIn：包装层的换入换出会让整页元素树
+                            // 每次切页都重挂载（卡片重新 initState、滚动位置丢失）。
                             child: TickerMode(
                               enabled: i == _index,
-                              child: i == _index
-                                  ? _PageFadeIn(
-                                      key: ValueKey('fade-$_index'),
-                                      child: _pageFor(i),
-                                    )
-                                  : _pageFor(i),
+                              child: _pageFor(i),
                             ),
                           ),
                     ],
@@ -217,29 +214,6 @@ class _AppWindowListener extends WindowListener {
   @override
   void onWindowClose() {
     onClose();
-  }
-}
-
-class _PageFadeIn extends StatelessWidget {
-  const _PageFadeIn({super.key, required this.child});
-
-  final Widget child;
-
-  @override
-  Widget build(BuildContext context) {
-    return TweenAnimationBuilder<double>(
-      tween: Tween(begin: 0, end: 1),
-      duration: const Duration(milliseconds: 180),
-      curve: Curves.easeOutCubic,
-      builder: (context, value, child) => Opacity(
-        opacity: value.clamp(0.0, 1.0),
-        child: FractionalTranslation(
-          translation: Offset(0, 0.015 * (1 - value)),
-          child: child,
-        ),
-      ),
-      child: child,
-    );
   }
 }
 

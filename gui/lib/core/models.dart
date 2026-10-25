@@ -167,6 +167,7 @@ class TaskActivity {
     required this.phase,
     this.name = '',
     this.course = '',
+    this.courseId = '',
     this.chapter = '',
     this.progress,
     this.result,
@@ -183,6 +184,8 @@ class TaskActivity {
   final String phase; // start | progress | done | error | retry | stats | scored | finished
   final String name;
   final String course;
+  /// 事件来源课程 ID（同名课程多班级时按它精确归位）。
+  final String courseId;
   final String chapter;
   final double? progress;
   final String? result;
@@ -204,6 +207,7 @@ class TaskActivity {
         phase: '${json['phase'] ?? ''}',
         name: '${json['name'] ?? ''}',
         course: '${json['course'] ?? ''}',
+        courseId: '${json['course_id'] ?? ''}',
         chapter: '${json['chapter'] ?? ''}',
         progress: (json['progress'] as num?)?.toDouble(),
         result: json['result'] is String ? json['result'] as String : null,

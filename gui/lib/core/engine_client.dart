@@ -37,6 +37,15 @@ class EngineClient {
   int? get port => _port;
   String get dataDirPath => _dataDir?.path ?? '';
 
+  /// 平台图片走引擎本地代理（官方图床有 Referer 防盗链，应用直连会被拒）。
+  /// 引擎未就绪时返回原始地址（由调用方的 errorBuilder 兜底）。
+  String mediaProxyUrl(String raw) {
+    final enginePort = _port;
+    if (enginePort == null || raw.isEmpty) return raw;
+    return 'http://127.0.0.1:$enginePort/media?url='
+        '${Uri.encodeQueryComponent(raw)}';
+  }
+
   Directory _resolveDataDir() {
     final base = Platform.environment['APPDATA'] ?? Directory.systemTemp.path;
     return Directory('$base${Platform.pathSeparator}FXXXXC');

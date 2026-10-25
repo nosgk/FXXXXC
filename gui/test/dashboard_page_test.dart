@@ -10,6 +10,10 @@ void main() {
   Future<ProviderContainer> pumpDashboard(WidgetTester tester) async {
     final container = ProviderContainer();
     addTearDown(container.dispose);
+    // 应用窗口最小 1000x700；看板在极矮视口会自适应收起头尾，测试用真实尺寸。
+    tester.view.physicalSize = const Size(1280, 900);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
     await tester.pumpWidget(
       UncontrolledProviderScope(
         container: container,
@@ -26,7 +30,7 @@ void main() {
     // 状态芯片与活动流标题
     expect(find.text('空闲'), findsWidgets);
     expect(find.textContaining('开始学习'), findsWidgets);
-    expect(find.text('活动流'), findsOneWidget);
+    expect(find.text('课程看板'), findsOneWidget);
     // 空态引导四步
     expect(find.text('在「课程」页刷新并勾选要学习的课程'), findsOneWidget);
   });
@@ -64,8 +68,9 @@ void main() {
     expect(find.text('1/4'), findsOneWidget); // 章节进度卡
     expect(find.text('1'), findsWidgets); // 失败章节卡等
     expect(find.textContaining('1 / 4 章节'), findsOneWidget);
-    // 活动流行：完成 + 课程名
+    // 最新动态条：完成 + 课程名
     expect(find.textContaining('完成 1.1 导论.mp4'), findsOneWidget);
+    expect(find.text('最新动态'), findsOneWidget);
     expect(find.textContaining('高等数学'), findsWidgets);
     // 暂停/停止控制可用
     expect(find.widgetWithText(OutlinedButton, '暂停'), findsOneWidget);

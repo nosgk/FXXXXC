@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../core/engine_client.dart';
@@ -35,7 +36,7 @@ class _NumericRange {
   final num max;
   final bool isInt;
 
-  String get hint => '$min~$max';
+  String get hint => '$min~$max（超出自动夹取）';
 }
 
 class _Section {
@@ -227,6 +228,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
   /// 收起/展开的答题源卡片（未展开即收起态：只显示摘要行）。
   final _expandedBanks = <String>{};
   bool _saving = false;
+  bool _fetchingOcs = false;
   bool _dark = false;
 
   bool get _hasChanges => _dirty.isNotEmpty || _removedBanks.isNotEmpty;
@@ -421,13 +423,54 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
   // ------------------------------------------------------------- 编辑动作
 
   void _markDirty(String key, String value, {bool silent = false}) {
-    _controllers.putIfAbsent(key, () => TextEditingController()).text = value;
+    final controller = _controllers.putIfAbsent(key, () => TextEditingController());
+    // 仅在值真正不同（程序化改写）时才回写；onChanged 路径下 controller 已是新值，
+    // 回写会重置 composing region，打断中文输入法的连续组词（“连字”）。
+    if (controller.text != value) {
+      controller.text = value;
+    }
     if (value != (_initial[key] ?? '')) {
       _dirty.add(key);
     } else {
       _dirty.remove(key);
     }
     if (!silent) setState(() {});
+  }
+
+  /// 从订阅链接拉取 OCS 题库配置 JSON 并填入 ocs_wrappers。
+  Future<void> _fetchOcsConfig(String sectionId) async {
+    final url = _text(_keyOf(sectionId, 'ocs_config_url')).trim();
+    if (url.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('先填写题库配置订阅链接')),
+      );
+      return;
+    }
+    setState(() => _fetchingOcs = true);
+    try {
+      final result = await ref
+          .read(engineClientProvider)
+          .rpc('tiku.ocs.fetch', {'url': url});
+      final wrappers = result is Map ? '${result['wrappers'] ?? ''}' : '';
+      final count = result is Map ? (result['count'] as num?)?.toInt() ?? 0 : 0;
+      if (wrappers.isEmpty) {
+        throw EngineException(-1, '未获取到题库配置');
+      }
+      _markDirty(_keyOf(sectionId, 'ocs_wrappers'), wrappers);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('已获取 $count 个题库配置，检查无误后记得保存')),
+        );
+      }
+    } on EngineException catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('获取失败：${error.message}')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _fetchingOcs = false);
+    }
   }
 
   // ------------------------------------------------------------- 保存 / 测试
@@ -448,12 +491,12 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         final key = _keyOf(sectionKey, field.key);
         final text = _controllers[key]?.text.trim() ?? '';
         if (text.isEmpty) continue;
+        // 只校验“是数字”；范围不再硬拦 —— 超出部分由引擎按支持的最大值夹取。
         final value = range.isInt ? int.tryParse(text) : double.tryParse(text);
-        if (value == null || value < range.min || value > range.max) {
+        if (value == null) {
           return {
             'key': key,
-            'message':
-                '${field.label} 需为${range.isInt ? '整数' : '数字'}（${range.hint}）',
+            'message': '${field.label} 需为${range.isInt ? '整数' : '数字'}',
           };
         }
       }
@@ -872,6 +915,32 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                               const _Field('name', '实例名称',
                                   helper: '仅用于在本页展示，方便区分多个实例'),
                             ),
+                            if (provider == 'TikuOcs') ...[
+                              _buildField(
+                                context,
+                                sectionId,
+                                const _Field('ocs_config_url', '题库配置订阅链接',
+                                    helper:
+                                        '题库站提供的配置获取链接；粘贴后点「自动获取」，'
+                                        '会把拿到的题库配置 JSON 填入下方文本框'),
+                              ),
+                              Align(
+                                alignment: Alignment.centerRight,
+                                child: OutlinedButton.icon(
+                                  onPressed: _fetchingOcs
+                                      ? null
+                                      : () => _fetchOcsConfig(sectionId),
+                                  icon: _fetchingOcs
+                                      ? const SizedBox(
+                                          width: 14, height: 14,
+                                          child: CircularProgressIndicator(
+                                              strokeWidth: 2))
+                                      : const Icon(Icons.cloud_download_outlined,
+                                          size: 18),
+                                  label: const Text('自动获取配置 JSON'),
+                                ),
+                              ),
+                            ],
                             for (final field in providerFields)
                               _buildField(context, sectionId, field),
                             if (providerFields.isEmpty)
@@ -913,6 +982,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                 : (_notificationProviderMeta[provider] ?? '自定义 provider'),
           ),
           items: [
+            const DropdownMenuItem(value: '', child: Text('（留空 / 不启用）')),
             for (final option in _notificationProviderMeta.keys)
               DropdownMenuItem(value: option, child: Text(option)),
           ],
@@ -967,6 +1037,8 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                 : null,
           ),
           items: [
+            // 每个可选选项都配一个空白项：留空 = 不填写/不启用（引擎按默认处理）
+            const DropdownMenuItem(value: '', child: Text('（留空 / 不启用）')),
             for (final option in field.options!)
               DropdownMenuItem(value: option, child: Text(option)),
           ],
@@ -975,6 +1047,15 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       );
     }
 
+    final numericFormatters = field.numeric == null
+        ? null
+        : <TextInputFormatter>[
+            // 数字字段不设长度上限，只放行数字（小数再放行小数点）；
+            // 范围由引擎按其支持的最大值夹取（helper 中展示范围）。
+            FilteringTextInputFormatter.allow(
+              RegExp(field.numeric!.isInt ? r'[-0-9]' : r'[-0-9.]'),
+            ),
+          ];
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 6),
       child: TextField(
@@ -982,8 +1063,10 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
         obscureText: field.obscure,
         minLines: field.multiline ? 5 : 1,
         maxLines: field.multiline ? 10 : 1,
-        keyboardType:
-            field.multiline ? TextInputType.multiline : TextInputType.text,
+        keyboardType: field.multiline
+            ? TextInputType.multiline
+            : (field.numeric != null ? TextInputType.number : TextInputType.text),
+        inputFormatters: numericFormatters,
         onChanged: (value) => _markDirty(key, value),
         decoration: InputDecoration(
           labelText: field.label,

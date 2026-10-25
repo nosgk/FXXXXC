@@ -445,7 +445,9 @@ class CourseDetailStore
 
   Future<void> ensure(String key, {bool force = false}) async {
     final current = state[key];
-    if (!force && current != null && current.hasValue) return;
+    // 读一次语义：有数据【或已失败】都不自动重试——失败卡片提供手动重试，
+    // 否则每次切页/滚动重挂载都会对失败源发起重试风暴（日志噪声的另一半）。
+    if (!force && current != null && (current.hasValue || current.hasError)) return;
     if (_inFlight.contains(key)) return;
     _inFlight.add(key);
     state = {

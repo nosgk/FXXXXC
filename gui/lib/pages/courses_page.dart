@@ -354,6 +354,9 @@ class _CourseCardState extends ConsumerState<_CourseCard> {
           children: [
             _CardCover(
               course: course,
+              coverUrl: course.cover.isEmpty
+                  ? ''
+                  : ref.read(engineClientProvider).mediaProxyUrl(course.cover),
               selected: selected,
               onOpenDetail: () => _openDetailSheet(context, ref, course),
             ),
@@ -396,11 +399,13 @@ class _CourseCardState extends ConsumerState<_CourseCard> {
 class _CardCover extends StatelessWidget {
   const _CardCover({
     required this.course,
+    required this.coverUrl,
     required this.selected,
     required this.onOpenDetail,
   });
 
   final Course course;
+  final String coverUrl;
   final bool selected;
   final VoidCallback onOpenDetail;
 
@@ -415,10 +420,10 @@ class _CardCover extends StatelessWidget {
         children: [
           InkWell(
             onTap: onOpenDetail,
-            child: course.cover.isEmpty
+            child: coverUrl.isEmpty
                 ? _CoverPlaceholder(title: course.title)
                 : Image.network(
-                    course.cover,
+                    coverUrl, // 引擎本地代理（带 Referer），绕过图床防盗链
                     cacheWidth: 480, // 按显示尺寸解码，避免整图占内存
                     fit: BoxFit.cover,
                     // 封面就绪后 300ms 淡入；加载中/失败均回退占位。
@@ -574,12 +579,42 @@ class _CardProgress extends ConsumerWidget {
       );
     }
 
-    // 明细未就绪：细骨架条占位（失败也保持安静占位，详情弹窗里给重试）。
+    // 明细读取失败：可点按重试（不再无限脉冲，也不再静默）。
+    if (detailAsync?.hasError ?? false) {
+      return InkWell(
+        onTap: () => ref
+            .read(courseDetailStoreProvider.notifier)
+            .refresh(course.detailKey),
+        child: Row(
+          children: [
+            Icon(Icons.error_outline, size: 14, color: scheme.error),
+            const SizedBox(width: 6),
+            Expanded(
+              child: Text('章节状态读取失败 · 点按重试',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: theme.textTheme.labelSmall
+                      ?.copyWith(color: scheme.error)),
+            ),
+          ],
+        ),
+      );
+    }
+
+    // 明细读取中：静态细条占位（无动画，避免“一直闪烁”的观感）。
     return Row(
       children: [
-        const Expanded(child: SkeletonBox(height: 4, radius: 2)),
+        Expanded(
+          child: Container(
+            height: 5,
+            decoration: BoxDecoration(
+              color: scheme.surfaceContainerHighest.withValues(alpha: 0.7),
+              borderRadius: BorderRadius.circular(3),
+            ),
+          ),
+        ),
         const SizedBox(width: 8),
-        Icon(Icons.info_outline, size: 14, color: scheme.outline),
+        Icon(Icons.hourglass_empty_outlined, size: 13, color: scheme.outline),
       ],
     );
   }
