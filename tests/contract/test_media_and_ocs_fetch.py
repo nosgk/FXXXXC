@@ -90,6 +90,53 @@ class TestOcsFetchRpc:
             self._service(tmp_path).tiku_ocs_fetch({"url": "ftp://x"})
 
 
+def _engine(tmp_path):
+    return EngineService(data_dir=tmp_path)
+
+
+class TestOcsBuiltin:
+    def test_builtins_catalog_exposes_no_template(self, tmp_path):
+        result = _engine(tmp_path).dispatch("tiku.ocs.builtins", {})
+        subs = result["subscriptions"]
+        assert [sub["id"] for sub in subs] == ["yanxi"]
+        assert all("template" not in sub for sub in subs)
+        assert subs[0]["needs_token"] is True
+
+    def test_builtin_generates_wrapper_with_token(self, tmp_path):
+        result = _engine(tmp_path).tiku_ocs_builtin(
+            {"id": "yanxi", "token": "T1"})
+        wrapper = __import__("json").loads(result["wrappers"])[0]
+        assert wrapper["name"] == "言溪题库"
+        assert wrapper["url"] == "https://tk.enncy.cn/query?question=${title}"
+        assert wrapper["data"] == {"token": "T1"}
+        assert wrapper["answer_path"] == "data.answer"
+
+    def test_builtin_requires_token(self, tmp_path):
+        with pytest.raises(RpcError) as excinfo:
+            _engine(tmp_path).tiku_ocs_builtin({"id": "yanxi", "token": ""})
+        assert "token" in str(excinfo.value)
+
+    def test_builtin_rejects_unknown_id(self, tmp_path):
+        with pytest.raises(RpcError):
+            _engine(tmp_path).tiku_ocs_builtin({"id": "nope", "token": "x"})
+
+    def test_generated_wrapper_is_valid_tiku_ocs_config(self, tmp_path):
+        """生成的配置要能直接被 TikuOcs 解析并命中言溪响应形态。"""
+        import json as json_mod
+
+        from api.answer import TikuOcs
+
+        wrappers = _engine(tmp_path).tiku_ocs_builtin(
+            {"id": "yanxi", "token": "T1"})["wrappers"]
+        tiku = TikuOcs()
+        tiku.config_set({"ocs_wrappers": wrappers})
+        tiku._init_tiku()
+        assert len(tiku._wrappers) == 1
+        assert tiku._extract_answer(
+            {"code": 1, "data": {"answer": "正确", "times": 9}},
+            tiku._wrappers[0]) == "正确"
+
+
 class TestEnumEmptyOption:
     def test_enum_blank_is_valid(self):
         for section, key in (("common", "notopen_action"),

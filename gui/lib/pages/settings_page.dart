@@ -138,6 +138,12 @@ const _bankBaseFields = <_Field>[
 
 const _bankProviderOptions = ['TikuYanxi', 'TikuGo', 'TikuLike', 'TikuAdapter', 'AI', 'SiliconFlow', 'TikuManual'];
 
+/// 内置 OCS 题库订阅目录（与引擎 OCS_BUILTIN_SUBSCRIPTIONS 保持同步；
+/// 引擎侧 tiku.ocs.builtin 按 id 校验并生成配置）。
+const _ocsBuiltinCatalog = <String, String>{
+  'yanxi': '言溪题库（官方合作，需 token）',
+};
+
 /// 通知源：全部走 webhook URL，Telegram 额外要 chat_id。
 const _notificationSection = _Section('通知', 'notification', [
   _Field('provider', '通知服务'),
@@ -229,7 +235,10 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
   final _expandedBanks = <String>{};
   bool _saving = false;
   bool _fetchingOcs = false;
+  bool _generatingBuiltin = false;
   bool _dark = false;
+  /// 每个答题源实例当前选择的内置订阅 id。
+  final _builtinSelection = <String, String>{};
 
   bool get _hasChanges => _dirty.isNotEmpty || _removedBanks.isNotEmpty;
 
@@ -470,6 +479,41 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
       }
     } finally {
       if (mounted) setState(() => _fetchingOcs = false);
+    }
+  }
+
+  /// 按内置订阅模板 + token 生成 OCS 配置并填入 ocs_wrappers。
+  Future<void> _generateBuiltinOcs(String sectionId) async {
+    final bankId = _builtinSelection[sectionId];
+    if (bankId == null || bankId.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('先在「内置题库订阅」里选择一个源')),
+      );
+      return;
+    }
+    final token = _text(_keyOf(sectionId, 'ocs_token')).trim();
+    setState(() => _generatingBuiltin = true);
+    try {
+      final result = await ref.read(engineClientProvider).rpc(
+          'tiku.ocs.builtin', {'id': bankId, 'token': token});
+      final wrappers = result is Map ? '${result['wrappers'] ?? ''}' : '';
+      if (wrappers.isEmpty) {
+        throw EngineException(-1, '生成失败');
+      }
+      _markDirty(_keyOf(sectionId, 'ocs_wrappers'), wrappers);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('已生成题库配置，检查无误后记得保存')),
+        );
+      }
+    } on EngineException catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(error.message)),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _generatingBuiltin = false);
     }
   }
 
@@ -919,7 +963,7 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                               _buildField(
                                 context,
                                 sectionId,
-                                const _Field('ocs_config_url', '题库配置订阅链接',
+                                const _Field('ocs_config_url', '题库配置订阅链接（可选）',
                                     helper:
                                         '题库站提供的配置获取链接；粘贴后点「自动获取」，'
                                         '会把拿到的题库配置 JSON 填入下方文本框'),
@@ -939,6 +983,55 @@ class _SettingsPageState extends ConsumerState<SettingsPage> {
                                           size: 18),
                                   label: const Text('自动获取配置 JSON'),
                                 ),
+                              ),
+                              const SizedBox(height: 6),
+                              _buildField(
+                                context,
+                                sectionId,
+                                const _Field('ocs_token', '题库 Token（内置订阅用）',
+                                    helper: '在题库站个人中心获取；配合下方内置订阅一键生成配置'),
+                              ),
+                              Row(
+                                children: [
+                                  Expanded(
+                                    child: DropdownButtonFormField<String>(
+                                      initialValue:
+                                          _builtinSelection[sectionId],
+                                      decoration: const InputDecoration(
+                                        labelText: '内置题库订阅',
+                                        helperText: '官方合作题库模板，填好 token 一键生成',
+                                      ),
+                                      items: [
+                                        for (final entry
+                                            in _ocsBuiltinCatalog.entries)
+                                          DropdownMenuItem(
+                                            value: entry.key,
+                                            child: Text(entry.value),
+                                          ),
+                                      ],
+                                      onChanged: (value) => setState(() {
+                                        if (value != null) {
+                                          _builtinSelection[sectionId] = value;
+                                        }
+                                      }),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  OutlinedButton.icon(
+                                    onPressed: _generatingBuiltin
+                                        ? null
+                                        : () => _generateBuiltinOcs(sectionId),
+                                    icon: _generatingBuiltin
+                                        ? const SizedBox(
+                                            width: 14,
+                                            height: 14,
+                                            child: CircularProgressIndicator(
+                                                strokeWidth: 2))
+                                        : const Icon(Icons.auto_awesome,
+                                            size: 18),
+                                    label: const Text('一键生成'),
+                                  ),
+                                ],
                               ),
                             ],
                             for (final field in providerFields)

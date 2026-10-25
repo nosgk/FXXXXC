@@ -31,6 +31,26 @@ from fxxxxc.orchestrator import ChapterResult, ChapterTask, JobProcessor, proces
 
 _BOOL_TRUE = {"1", "true", "yes", "y", "on"}
 
+# 内置 OCS 题库订阅目录：只收录接口已被本引擎验证过的源。
+# 言溪是 ocsjs 官方文档推荐的题库（docs.ocsjs.com 自动答题教程），
+# 其查询接口与本引擎 TikuYanxi 使用的是同一个（tk.enncy.cn/query），
+# 因此可以安全地模板化生成 AnswererWrapper 配置，无需猜测端点。
+OCS_BUILTIN_SUBSCRIPTIONS: dict[str, dict] = {
+    "yanxi": {
+        "id": "yanxi",
+        "name": "言溪题库",
+        "desc": "ocsjs 官方文档推荐题库；需在 tk.enncy.cn 获取 token（按次计费）",
+        "docs_url": "https://tk.enncy.cn",
+        "needs_token": True,
+        "template": {
+            "name": "言溪题库",
+            "url": "https://tk.enncy.cn/query?question=${title}",
+            "data": {"token": "__TOKEN__"},
+            "answer_path": "data.answer",
+        },
+    },
+}
+
 # 题库实例段前缀：每个 [tiku_bank.<id>] 是一个独立的题库源配置（含自己的
 # provider 与专属键），按 priority 升序组成梯度回退链，天然支持多题库并行启用。
 BANK_SECTION_PREFIX = "tiku_bank."
@@ -321,6 +341,11 @@ class EngineService:
             "manual.skip": self.manual_skip,
             "tiku.test": lambda p: self.tiku_test(),
             "tiku.ocs.fetch": self.tiku_ocs_fetch,
+            "tiku.ocs.builtins": lambda p: {"subscriptions": [
+                {key: value for key, value in sub.items() if key != "template"}
+                for sub in OCS_BUILTIN_SUBSCRIPTIONS.values()
+            ]},
+            "tiku.ocs.builtin": self.tiku_ocs_builtin,
             "notification.test": lambda p: self.notification_test(),
         }
         handler = handlers.get(method)
@@ -1043,6 +1068,35 @@ class EngineService:
                     "wrappers": json.dumps(valid, ensure_ascii=False),
                 }
         raise RpcError(-32602, "链接内容不是可识别的 OCS 题库配置 JSON（需含 url 字段的对象数组）")
+
+    def tiku_ocs_builtin(self, params: dict) -> dict:
+        """按内置订阅模板生成 OCS（AnswererWrapper）配置。
+
+        内置源只收录接口经本引擎验证过的题库站；言溪模板与其原生
+        TikuYanxi 集成共用同一查询端点，token 由用户在题库站获取。
+        """
+        bank_id = str(params.get("id") or "").strip()
+        subscription = OCS_BUILTIN_SUBSCRIPTIONS.get(bank_id)
+        if subscription is None:
+            known = "/".join(OCS_BUILTIN_SUBSCRIPTIONS)
+            raise RpcError(-32602, f"未知内置订阅: {bank_id or '(空)'}（可用: {known}）")
+        token = str(params.get("token") or "").strip()
+        if subscription.get("needs_token") and not token:
+            raise RpcError(
+                -32602,
+                f"「{subscription['name']}」需要 token：请到 {subscription.get('docs_url', '题库站')} 获取后填入",
+            )
+        template = dict(subscription["template"])
+        if "data" in template:
+            template["data"] = {
+                key: (value.replace("__TOKEN__", token) if isinstance(value, str) else value)
+                for key, value in template["data"].items()
+            }
+        return {
+            "ok": True,
+            "count": 1,
+            "wrappers": json.dumps([template], ensure_ascii=False),
+        }
 
     def tiku_test(self) -> dict:
         try:
